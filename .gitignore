@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Training outputs
+runs/
+outputs/
+logs/
+checkpoints/
+weights/
+*.pth
+*.pt
+*.onnx
+*.rknn
+
+# Dataset
+datasets/
+data/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini

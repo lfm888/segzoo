@@ -1,0 +1,8 @@
+# torch / torchvision 由 setup_env.ps1 单独用 cu121 源安装，这里不含
+numpy==1.26.4
+opencv-python
+segmentation-models-pytorch==0.3.4
+# 旧版 timm 需要 huggingface_hub 里的 cached_download，新版 hub 已移除
+huggingface_hub<0.26
+onnx
+onnxruntime
