@@ -179,9 +179,14 @@ def seg_metrics(conf, num_classes):
         vals = x[1:][~np.isnan(x[1:])] if num_classes > 1 else np.array([])
         return float(vals.mean()) if vals.size else 0.0
 
+    total = float(conf.sum())
+    fg_total = float(conf[1:, :].sum()) if num_classes > 1 else 0.0   # 真值是前景的像素数
+    pacc = float(tp.sum() / max(total, 1.0))                          # 全部像素准确率
+    acc_fg = float(tp[1:].sum() / fg_total) if fg_total > 0 else 0.0   # 只看前景像素的准确率
+
     return {"dice": dice.tolist(), "iou": iou.tolist(), "prec": prec.tolist(), "rec": rec.tolist(),
             "f1": f1.tolist(),
-            "pacc": float(tp.sum() / max(conf.sum(), 1.0)),
+            "pacc": pacc, "acc_fg": acc_fg, "fg_ratio": float(fg_total / max(total, 1.0)),
             "mdice": fg_mean(dice), "miou": fg_mean(iou),
             "mprec": fg_mean(prec), "mrec": fg_mean(rec), "mf1": fg_mean(f1)}
 

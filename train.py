@@ -25,14 +25,14 @@ from utils import (abspath, imwrite_unicode, normalize, parse_args, render_predi
 DEFAULTS = {
     # ---- 数据 ----
     "data_root": "data",              # 数据根目录（相对框架目录，也可写绝对路径如 E:/xxx/data）
-    "dataset": "aidk_partial",                # 数据集文件夹名：<data_root>/<dataset>/{train_dataset,labels}
+    "dataset": "lens_dataset",                # 数据集文件夹名：<data_root>/<dataset>/{train_dataset,labels}
     "images_subdir": "train_dataset",
     "labels_subdir": "labels",
     "json_merge_labels": False,       # labelme 里出现多个 label 名时，True=全部并成同一前景类
     "mask_mode": "auto",              # mask 标签编码：auto / index(单通道索引图) / channels(每通道=1类，AIDK 风格)
     "class_names": [],                # 可选类名（含背景也行）；空=自动读 <dataset>/classes.txt，没有则用默认名
     "img_size": [224, 224],           # [H, W]，需为 32 的倍数。AIDK 常用 288,512；labelme 数据用 224,224 或 64,64
-    "in_channels": 1,                 # 1=灰度，3=RGB
+    "in_channels": 3,                 # 1=灰度，3=RGB
     "num_classes": 0,                 # 含背景；0=自动（labelme 单类别 -> 2，AIDK 三通道 mask -> 4）
     "mean": [127.5],                  # 归一化 (x-mean)/std，0~255 单位；RKNN 转换会读同一组值
     "std": [127.5],
@@ -50,15 +50,17 @@ DEFAULTS = {
     "encoder": "resnet18",            # resnet18 / resnet34 / mobilenet_v2 / tu-xxx(timm 模型) ...
     "encoder_weights": "none",    # imagenet 或 none（下载失败会自动退回 none 并提示）
     # ---- 训练 ----
-    "epochs": 3,
+    "epochs": 30,
     "batch_size": 8,
     "lr": 1e-3,
     "weight_decay": 1e-4,
-    "loss": "dice",                # ce / dice / ce_dice
+    "loss": "ce_dice",                # ce / dice / ce_dice
     "amp": True,                      # 混合精度（仅 CUDA）
     "num_workers": 0,                 # 数据已缓存且增强很轻，Windows 下 0 最省事
     "device": "auto",                 # auto / cuda / cpu
     "progress_bar": True,             # 每个 epoch 内的进度条（终端里原地刷新，非终端每 20% 打一行）
+    "acc_exclude_bg": True,           # True = 打印/汇总里的 Acc 只统计前景像素（不含背景），
+                                      #        前景占比很小时才能看出真实分割质量；两种口径都会写进 log.csv / results.json
     "vis_samples": 8,                 # 训练结束后保存多少张验证集可视化（虚线=真值，色块=预测，一张图对比）
     "vis_alpha": 0.45,                # 可视化里分割色块的透明度
     # ---- 数据增强（概率或幅度，设 0 即关闭）----
@@ -298,21 +300,26 @@ def print_summary(cfg, info, train_ds, val_ds, train_loader, model, C, hw, devic
     return total / 1e6, gflops
 
 
-def print_epoch(ep, n_ep, tm, vm, names, lr, t_train, t_val, elapsed, eta, is_best):
-    """每个 epoch 一张小表：train / valid 的 loss、mDice、mIoU、准确率 + 各类 Dice。"""
+def print_epoch(ep, n_ep, tm, vm, names, lr, t_train, t_val, elapsed, eta, is_best,
+                acc_key="acc_fg", acc_label="Acc(fg)"):
+    """每个 epoch 一张小表：train / valid 的 loss、mDice、mIoU、准确率 + 各类 Dice。
+    acc_key="acc_fg" 时准确率只算前景像素（不含背景），="pacc" 时算全部像素。"""
     cls = " | ".join("%s %.3f" % (_short(n, 10), d) for n, d in zip(names, vm["dice"]))
     cls_t = " | ".join("%s %.3f" % (_short(n, 10), d) for n, d in zip(names, tm["dice"]))
     print("-" * W)
     print("Epoch %3d/%-3d  lr %.2e  |  训练 %s + 验证 %s = %s  |  已用 %s  剩余 %s" % (
         ep, n_ep, lr, _fmt_secs(t_train), _fmt_secs(t_val), _fmt_secs(t_train + t_val),
         _fmt_secs(elapsed), _fmt_secs(eta)))
-    print("  %-6s %-9s %-9s %-9s %-9s %s" % ("phase", "loss", "mDice", "mIoU", "Acc", "各类 Dice"))
-    print("  %-6s %-9.4f %-9.4f %-9.4f %-9.4f %s" % ("train", tm["loss"], tm["mdice"], tm["miou"], tm["pacc"], cls_t))
+    print("  %-6s %-9s %-9s %-9s %-9s %s" % ("phase", "loss", "mDice", "mIoU", acc_label, "各类 Dice"))
+    print("  %-6s %-9.4f %-9.4f %-9.4f %-9.4f %s" % (
+        "train", tm["loss"], tm["mdice"], tm["miou"], tm[acc_key], cls_t))
     print("  %-6s %-9.4f %-9.4f %-9.4f %-9.4f %s%s" % (
-        "valid", vm["loss"], vm["mdice"], vm["miou"], vm["pacc"], cls,
+        "valid", vm["loss"], vm["mdice"], vm["miou"], vm[acc_key], cls,
         "   <- best" if is_best else ""))
     print("  valid 前景均值:  Dice %.4f  IoU %.4f  P %.4f  R %.4f  F1 %.4f" % (
         vm["mdice"], vm["miou"], vm["mprec"], vm["mrec"], vm["mf1"]))
+    print("  valid 准确率:    全部像素 %.4f  前景像素 %.4f（前景占 %.2f%%）" % (
+        vm["pacc"], vm["acc_fg"], 100.0 * vm["fg_ratio"]))
     sys.stdout.flush()
 
 
@@ -369,10 +376,12 @@ def run(cfg):
     best, best_epoch, best_metrics = -1.0, 0, None
     names = list(info["class_names"][:int(C)]) + ["class_%d" % i for i in range(len(info["class_names"]), int(C))]
     t_train_total = 0.0
+    use_fg_acc = bool(cfg.get("acc_exclude_bg", True))
+    acc_key, acc_label = ("acc_fg", "Acc(fg)") if use_fg_acc else ("pacc", "Acc")
     with open(run_dir / "log.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["epoch", "train_loss", "val_loss", "train_mdice", "train_miou", "mdice", "miou", "pacc", "lr"]
-                   + ["dice_c%d" % c for c in range(int(C))])
+        w.writerow(["epoch", "train_loss", "val_loss", "train_mdice", "train_miou", "mdice", "miou",
+                    "pacc", "acc_fg", "lr"] + ["dice_c%d" % c for c in range(int(C))])
         for ep in range(1, cfg["epochs"] + 1):
             model.train()
             tl, tn = 0.0, 0
@@ -411,14 +420,14 @@ def run(cfg):
                 best, best_epoch, best_metrics = m["mdice"], ep, m
                 torch.save({"model": model.state_dict(), "meta": meta}, run_dir / "best.pth")
 
-            w.writerow([ep, tm["loss"], m["loss"], tm["mdice"], tm["miou"], m["mdice"], m["miou"], m["pacc"], lr_now]
-                       + m["dice"])
+            w.writerow([ep, tm["loss"], m["loss"], tm["mdice"], tm["miou"], m["mdice"], m["miou"],
+                        m["pacc"], m["acc_fg"], lr_now] + m["dice"])
             f.flush()
 
             t_train_total += t_train + t_val
             eta = t_train_total / ep * (cfg["epochs"] - ep)
             print_epoch(ep, cfg["epochs"], tm, m, names, lr_now, t_train, t_val,
-                        time.time() - t0, eta, is_best)
+                        time.time() - t0, eta, is_best, acc_key, acc_label)
     torch.save({"model": model.state_dict(), "meta": meta}, run_dir / "last.pth")
 
     # 用最佳权重做可视化与效率统计
@@ -433,6 +442,7 @@ def run(cfg):
         "mdice": _clean(best_metrics["mdice"]), "miou": _clean(best_metrics["miou"]),
         "mprec": _clean(best_metrics["mprec"]), "mrec": _clean(best_metrics["mrec"]),
         "mf1": _clean(best_metrics["mf1"]), "pacc": _clean(best_metrics["pacc"]),
+        "acc_fg": _clean(best_metrics["acc_fg"]), "fg_ratio": _clean(best_metrics["fg_ratio"]),
         "dice": _clean(best_metrics["dice"]), "iou": _clean(best_metrics["iou"]),
         "params_m": round(params_m, 3),
         "gflops": gflops,
@@ -451,9 +461,11 @@ def run(cfg):
     print("-" * W)
     lines = []
     _kv(lines, "最佳 epoch", "%d / %d" % (best_epoch, cfg["epochs"]))
-    _kv(lines, "验证指标", "mDice(fg) %.4f  mIoU %.4f  P %.4f  R %.4f  F1 %.4f  Acc %.4f" % (
+    _kv(lines, "验证指标", "mDice(fg) %.4f  mIoU %.4f  P %.4f  R %.4f  F1 %.4f" % (
         best_metrics["mdice"], best_metrics["miou"], best_metrics["mprec"], best_metrics["mrec"],
-        best_metrics["mf1"], best_metrics["pacc"]))
+        best_metrics["mf1"]))
+    _kv(lines, "准确率", "前景像素(Acc fg) %.4f   全部像素 %.4f   （前景占 %.2f%%）" % (
+        best_metrics["acc_fg"], best_metrics["pacc"], 100.0 * best_metrics["fg_ratio"]))
     _kv(lines, "各类 Dice", best_cls)
     _kv(lines, "效率", "%.3f M 参数  |  %.3f GFLOPs  |  %.2f ms/张 (%s)" % (
         results["params_m"], results["gflops"], results["latency_ms"], device.type))

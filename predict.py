@@ -33,7 +33,7 @@ DEFAULTS = {
     "runs_dir": "runs",
     "backend": "torch",      # torch / onnx（onnx 用同目录 model.onnx，用来验证导出后的模型）
     # ---- 输入 ----
-    "input_dir": r"E:\lfm\segzoo\data\CorneaNet",         # 空=训练时的数据集；也可以是【同格式数据集目录】或【纯图像目录】
+    "input_dir": r"",         # 空=训练时的数据集；也可以是【同格式数据集目录】或【纯图像目录】
     "images_subdir": "",     # 指定 input_dir 下的图像子目录（空=自动找 train_dataset/images，否则用 input_dir 本身）
     "labels_subdir": "labels",   # 数据集目录里的标签子目录名
     "split": "test",         # test / val / train / all；该目录没有 split.txt 时自动按 all
@@ -245,15 +245,17 @@ def main():
                 *["%.4f" % v if v == v else "-" for v in (m["dice"][c], m["iou"][c], m["prec"][c],
                                                           m["rec"][c], m["f1"][c])]))
         print("-" * 78)
-        print("  前景均值    Dice %.4f  IoU %.4f  P %.4f  R %.4f  F1 %.4f   像素准确率 %.4f" % (
-            m["mdice"], m["miou"], m["mprec"], m["mrec"], m["mf1"], m["pacc"]))
+        print("  前景均值    Dice %.4f  IoU %.4f  P %.4f  R %.4f  F1 %.4f" % (
+            m["mdice"], m["miou"], m["mprec"], m["mrec"], m["mf1"]))
+        print("  准确率      前景像素 %.4f   全部像素 %.4f   （前景占 %.2f%%）" % (
+            m["acc_fg"], m["pacc"], 100.0 * m["fg_ratio"]))
         print("=" * 78)
         res = {"split": used_split, "n_images": n_scored, "ckpt": str(ckpt),
                "input_dir": str(src["images"]),
                "arch": meta["arch"], "encoder": meta["encoder"], "img_size": [hw[0], hw[1]],
                "num_classes": C, "class_names": class_names,
                "mdice": m["mdice"], "miou": m["miou"], "mprec": m["mprec"], "mrec": m["mrec"],
-               "mf1": m["mf1"], "pacc": m["pacc"],
+               "mf1": m["mf1"], "pacc": m["pacc"], "acc_fg": m["acc_fg"], "fg_ratio": m["fg_ratio"],
                "dice": m["dice"], "iou": m["iou"], "prec": m["prec"], "rec": m["rec"], "f1": m["f1"]}
         out_json = out_dir / ("metrics_%s.json" % used_split)
         out_json.write_text(json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8")

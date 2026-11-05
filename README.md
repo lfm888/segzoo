@@ -154,26 +154,34 @@ segzoo 训练  |  unet + resnet18 @ 128x128  |  NVIDIA GeForce RTX 4060
   train [################--------] 9/12  75%  loss 0.1523  0m04s<0m01s   <- 进度条（progress_bar）
 ------------------------------------------------------------------------------
 Epoch   3/30    lr 9.02e-04  |  训练 5s + 验证 1s = 6s  |  已用 17s  剩余 2m14s
-  phase  loss      mDice     mIoU      Acc       各类 Dice
-  train  0.1523    0.8740    0.7761    0.9923    background 0.997 | center 0.874
-  valid  0.1401    0.8902    0.7935    0.9938    background 0.998 | center 0.890   <- best
+  phase  loss      mDice     mIoU      Acc(fg)   各类 Dice
+  train  0.1523    0.8740    0.7761    0.9521    background 0.997 | center 0.874
+  valid  0.1401    0.8902    0.7935    0.9634    background 0.998 | center 0.890   <- best
   valid 前景均值:  Dice 0.8902  IoU 0.7935  P 0.9051  R 0.8758  F1 0.8902
+  valid 准确率:    全部像素 0.9938  前景像素 0.9634（前景占 8.42%）
 ...
 ==============================================================================
 训练完成  |  unet + resnet18 @ 128x128  |  总用时 3m12s
 ------------------------------------------------------------------------------
   最佳 epoch      3 / 30
-  验证指标        mDice(fg) 0.8902  mIoU 0.7935  P 0.9051  R 0.8758  F1 0.8902  Acc 0.9938
+  验证指标        mDice(fg) 0.8902  mIoU 0.7935  P 0.9051  R 0.8758  F1 0.8902
+  准确率          前景像素(Acc fg) 0.9634   全部像素 0.9938   （前景占 8.42%）
   各类 Dice       background 0.998 | center 0.890
   效率            14.322 M 参数  |  2.652 GFLOPs  |  14.34 ms/张 (cuda)
   输出            E:\lfm\segzoo\runs\inner_circle_dataset\unet_resnet18_128x128
   产物            best.pth  last.pth  log.csv  results.json  vis/val_XXX.png
 ==============================================================================
 ```
-指标说明：`mDice`/`mIoU` 是**前景类平均**（不含背景 0，验证集里不存在的类跳过）；`Acc` 是像素准确率；
-每个 epoch 同时打印训练集与验证集指标（便于看是否过拟合）；`log.csv` 记录
-`epoch,train_loss,val_loss,train_mdice,train_miou,mdice,miou,pacc,lr,dice_c0...`。
-进度条可用 `--progress_bar false` 关闭（非终端环境自动改成每 20% 打一行）。
+指标说明：
+- `mDice` / `mIoU` / `P` / `R` / `F1` 都是**前景类平均**（不含背景 0；验证集里该类完全不存在的会跳过）
+- **准确率两种口径都会算**：`全部像素`（含背景，前景占比小时容易被抬到 0.99，参考价值低）和 `前景像素`（只看真值是前景的像素）
+- `--acc_exclude_bg true|false`（DEFAULTS 里的 `acc_exclude_bg`，**默认 true**）决定**表格里 Acc 列 / 汇总里的主指标**用哪种口径：
+  - `true`（默认）→ 列名变 `Acc(fg)`，只统计前景像素，前景只占 10% 时也能反映真实水平
+  - `false` → 列名是 `Acc`，含背景的像素准确率
+- 每个 epoch 同时打印训练集与验证集（便于判断过拟合）
+- `log.csv` 同时记两种口径：`epoch,train_loss,val_loss,train_mdice,train_miou,mdice,miou,pacc,acc_fg,lr,dice_c0...`；
+  `results.json` 里有 `pacc` / `acc_fg` / `fg_ratio`（前景像素占比）
+- 进度条可用 `--progress_bar false` 关闭（非终端环境自动改成每 20% 打一行）
 
 ## 预测 / 最终评估（`predict.py`）
 `--input_dir` 支持三种情况，代码会自动识别：
@@ -207,7 +215,8 @@ python predict.py --save_vis false                       # 只要指标，不存
   0    background     0.9821   0.9648   0.9803   0.9839   0.9821
   1    center         0.9432   0.8925   0.9510   0.9356   0.9432
 ------------------------------------------------------------------------------
-  前景均值    Dice 0.9432  IoU 0.8925  P 0.9510  R 0.9356  F1 0.9432   像素准确率 0.9774
+  前景均值    Dice 0.9432  IoU 0.8925  P 0.9510  R 0.9356  F1 0.9432
+  准确率      前景像素 0.9598   全部像素 0.9774   （前景占 6.1%）
 ==============================================================================
 ```
 指标在**模型输入尺寸**上算（预测结果与最近邻缩小的 GT 逐像素比），与训练/验证时用同一套 `utils.seg_metrics`。
