@@ -14,8 +14,10 @@
      或 classes.json（["background","Cornea",...]）
   3) 图像目录/标签目录里的 labelme .json 标签名（如 inner_circle_dataset 的 'center'，需个数与 mask 类别数一致）
   4) 默认名 class_1, class_2 ...
-训练/验证划分：默认随机（seed 决定）；若存在 <dataset>/split/test_train_data.csv
-  （image_id,category 两列，可选 fold 列），则按它划分（见 split_by_csv / train.py 的 split_csv 参数）。
+训练/验证/测试划分：固定写在 <dataset>/split.txt（一次生成，之后每次训练直接复用，可手工改）。
+  · train.py 只加载 train + val；test 段不参与训练/验证，留给 predict.py 做最终泛化评估
+  · 首次生成优先沿用 <dataset>/split/test_train_data.csv 的 category/fold，否则按 seed 随机划分
+    （val_ratio / test_ratio 只影响生成，不影响已存在的 split.txt）
 没有 labels 目录时，自动回退为把图像目录里的 labelme .json 当标签用。
 图像与标签按文件名主干匹配（也接受 xxx_mask / xxx_label / xxx_gt 等后缀）。
 """
@@ -37,6 +39,8 @@ SPLIT_CSV_CANDIDATES = ("split/test_train_data.csv", "test_train_data.csv", "spl
 MAX_INDEX_CLASSES = 64   # 索引图里超过这么多种像素值，就当成二值 mask（>0=前景）
 INFO_FILE = "label_info.txt"   # 标签扫描缓存（自动生成）
 INFO_VERSION = 1
+SPLIT_FILE = "split.txt"       # 固定数据划分（train/val/test，自动生成）
+SPLIT_NAMES = ("train", "val", "test")
 BG_NAMES = ("background", "bg", "backgrounds", "背景", "0", "none", "unlabeled")
 
 
@@ -625,49 +629,146 @@ class SegDataset(Dataset):
         return torch.from_numpy(x), torch.from_numpy(np.ascontiguousarray(mask).astype(np.int64))
 
 
-def split_by_csv(pairs, csv_path, val_ratio, seed):
-    """按 csv 里的 category / fold 列划分（参考 python_model_train 的 split/test_train_data.csv）。
-    category 只能是 train 的行才参与训练；val/valid 行直接做验证集，test 行不参与；
-    若还有 fold 列，则 fold==0 作为验证集（对应参考项目的 GroupKFold 第 0 折）。
-    返回 (train_idx, val_idx, note)。"""
-    table = read_split_csv(csv_path)
-    matched = [(i, *table[ip.name]) for i, (ip, _) in enumerate(pairs) if ip.name in table]
-    missing = len(pairs) - len(matched)
-    cats = [c for _, c, _ in matched]
-    print("[data] 使用 csv 划分: %s | 匹配 %d/%d 张%s" % (
-        csv_path, len(matched), len(pairs),
-        "（%d 张不在 csv 里，已忽略）" % missing if missing else ""))
-    if cats:
-        counts = {c: cats.count(c) for c in sorted(set(cats))}
-        if len(counts) > 1 or "train" not in counts:
-            print("         csv 里的 category 分布: %s" % counts)
+# --------------------------------------------------------------------------
+# 固定的三段划分：train / val / test
+#   一次生成、写到 <dataset>/split.txt，之后每次训练直接复用（可手工改）。
+#   train.py 只加载 train + val；test 留给 predict.py 做最终泛化评估。
+# --------------------------------------------------------------------------
+VAL_CATS = ("val", "valid", "validation", "dev", "eval")
 
-    val_cats = {"val", "valid", "validation", "dev", "eval"}
-    val_idx = [i for i, c, _ in matched if c in val_cats]
-    if val_idx:                       # csv 直接给了验证集
-        train_idx = [i for i, c, _ in matched if c == "train"]
-        note = "csv 的 val 行做验证集，train 行做训练集（test 行不参与）"
-    else:                             # 没给 val 行：只用 train 子集划分
-        pool = [(i, f) for i, c, f in matched if c == "train"]
-        if len(pool) < 2:
-            raise RuntimeError("csv 里 category=train 的图不足 2 张，无法划分（%s）" % csv_path)
-        if any(f is not None for _, f in pool):   # 有 fold 列：fold==0 做验证集
-            val_idx = [i for i, f in pool if f == 0]
-            train_idx = [i for i, f in pool if f != 0]
-            note = "csv 的 fold 列：fold==0 做验证集"
+
+def read_split_txt(path):
+    """读 <dataset>/split.txt -> {文件名: train|val|test}；不存在/格式不对返回 None。
+    每行一个 `文件名<TAB>split`，空行和 # 开头的注释行忽略（文件名为原图文件名，带扩展名）。"""
+    if not path.is_file():
+        return None
+    out = {}
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.replace(",", " ")
+        parts = parts.rsplit(maxsplit=1)          # 文件名里允许有空格
+        if len(parts) != 2:
+            continue
+        name, split = parts[0].strip(), parts[1].strip().lower()
+        if split in SPLIT_NAMES:
+            out[name] = split
+    return out or None
+
+
+def write_split_txt(path, pairs, assign, note, seed=None):
+    """写入固定的三段划分文件（人类可读，手改即生效；删掉会重新生成）。"""
+    real = {k: v for k, v in assign.items() if k in {ip.name for ip, _ in pairs}}
+    cnt = {k: sum(1 for v in real.values() if v == k) for k in SPLIT_NAMES}
+    lines = ["# segzoo 数据划分 train/val/test：自动生成，可手工修改，删除后会重新生成",
+             "# 生成时间 %s | seed=%s" % (time.strftime("%Y-%m-%d %H:%M:%S"), seed),
+             "# 来源: %s" % note,
+             "# 共 %d 张: train %d / val %d / test %d（train.py 只用 train+val，predict.py 默认用 test）"
+             % (len(real), cnt["train"], cnt["val"], cnt["test"]),
+             "# 格式: 文件名<TAB>split"]
+    for ip, _ in pairs:
+        if ip.name in real:
+            lines.append("%s\t%s" % (ip.name, real[ip.name]))
+    try:
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError as e:
+        print("[warn] split.txt 写入失败（不影响本次训练）: %s" % e)
+
+
+def make_splits(pairs, cfg, csv_path):
+    """生成三段划分：优先沿用 CSV 划分（train 池 + test 行），否则按 seed 随机划分。
+    返回 (assign, note)。"""
+    names = [ip.name for ip, _ in pairs]
+    val_ratio = float(cfg.get("val_ratio", 0.2))
+    test_ratio = float(cfg.get("test_ratio", 0.2))
+    seed = int(cfg.get("seed", 42))
+    assign, note = {}, ""
+
+    if csv_path is not None:
+        table = read_split_csv(csv_path)
+        cat_of = {n: table.get(n, ("", None)) for n in names}
+        train_pool = [n for n in names if cat_of[n][0] == "train"]
+        val_given = [n for n in names if cat_of[n][0] in VAL_CATS]
+        test_given = [n for n in names if cat_of[n][0] in ("test", "holdout")]
+        if val_given:
+            assign = {n: "train" for n in train_pool}
+            assign.update({n: "val" for n in val_given})
+            assign.update({n: "test" for n in test_given})
+            note = "%s 的 category 列（train/val/test 直接用 csv）" % csv_path.name
         else:
-            idx = [i for i, _ in pool]
-            random.Random(seed).shuffle(idx)
-            n_val = min(len(idx) - 1, max(1, int(round(len(idx) * val_ratio))))
-            val_idx, train_idx = sorted(idx[:n_val]), sorted(idx[n_val:])
-            note = "csv 的 train 子集按 seed=%d 随机划分验证集（无 val 行/fold 列）" % seed
-    if not val_idx or not train_idx:
-        raise RuntimeError("csv 划分后训练/验证集为空，请检查 %s" % csv_path)
-    return sorted(train_idx), sorted(val_idx), note
+            folds = [cat_of[n][1] for n in train_pool]
+            if any(f is not None for f in folds) and 0 in folds:
+                assign.update({n: "val" for n, f in zip(train_pool, folds) if f == 0})
+                assign.update({n: "train" for n, f in zip(train_pool, folds) if f != 0})
+                note = "%s 的 fold 列（fold==0 做 val）" % csv_path.name
+            else:
+                pool = list(train_pool)
+                random.Random(seed).shuffle(pool)
+                n_val = min(len(pool) - 1, max(1, int(round(len(pool) * val_ratio)))) if len(pool) > 1 else 0
+                assign.update({n: "val" for n in pool[:n_val]})
+                assign.update({n: "train" for n in pool[n_val:]})
+                note = "%s 的 train 子集按 seed=%d 划分 val" % (csv_path.name, seed)
+            assign.update({n: "test" for n in test_given})
+            note += "，csv 的 test 行作为 test"
+        dropped = [n for n in names if n not in assign]
+        if dropped:
+            print("[data] %d 张图不在 csv 里，已忽略（示例: %s）" % (len(dropped), dropped[:3]))
+        return assign, note
+
+    pool = list(names)
+    random.Random(seed).shuffle(pool)
+    n = len(pool)
+    n_test = max(1, int(round(n * test_ratio))) if test_ratio > 0 else 0
+    n_val = max(1, int(round(n * val_ratio))) if val_ratio > 0 else 0
+    n_test = min(n_test, max(0, n - 2))
+    n_val = min(n_val, max(0, n - n_test - 1))
+    assign.update({x: "test" for x in pool[:n_test]})
+    assign.update({x: "val" for x in pool[n_test:n_test + n_val]})
+    assign.update({x: "train" for x in pool[n_test + n_val:]})
+    note = "按 seed=%d 随机划分（val_ratio=%g, test_ratio=%g）" % (seed, val_ratio, test_ratio)
+    return assign, note
+
+
+def load_splits(pairs, root, cfg):
+    """读取或生成固定划分。返回 (assign{文件名: split}, 来源说明)。"""
+    rel = cfg.get("split_file", SPLIT_FILE)
+    path = (root / rel) if rel else None
+    if path is not None and not cfg.get("resplit", False):
+        table = read_split_txt(path)
+        if table:
+            on_disk = {ip.name for ip, _ in pairs}
+            assign = {n: s for n, s in table.items() if n in on_disk}
+            new = sorted(on_disk - set(table))
+            gone = sorted(set(table) - on_disk)
+            if new:
+                print("[warn] %d 张图不在 split.txt 里，本次不参与（示例: %s）；"
+                      "要把它们纳入就删掉 split.txt 重新生成，或手工加行" % (len(new), new[:3]))
+            if gone:
+                print("[warn] split.txt 里 %d 张图在磁盘上找不到，已忽略" % len(gone))
+            return assign, "%s（已存在，固定复用）" % path.name
+
+    csv_path = find_split_csv(root, cfg.get("split_csv", "auto"))
+    assign, note = make_splits(pairs, cfg, csv_path)
+    if path is not None:
+        write_split_txt(path, pairs, assign, note, seed=cfg.get("seed"))
+        print("[data] 已生成固定划分: %s（%s）" % (path, note))
+    return assign, ("%s（新建: %s）" % (path.name, note) if path is not None else note)
+
+
+def split_indices(pairs, assign):
+    """按 assign 取回三个下标列表。"""
+    out = {k: [] for k in SPLIT_NAMES}
+    for i, (ip, _) in enumerate(pairs):
+        s = assign.get(ip.name)
+        if s in out:
+            out[s].append(i)
+    return out["train"], out["val"], out["test"]
 
 
 def build_datasets(cfg):
-    """按 cfg 构建 (train_ds, val_ds, info)。划分由 seed 决定，同一数据集上不同模型的验证集完全相同。"""
+    """按 cfg 构建 (train_ds, val_ds, info)。划分是固定的（<dataset>/split.txt），
+    同一数据集上不同模型完全一致；test 段不参与训练/验证，留给 predict.py 做最终评估。"""
     root = abspath(cfg["data_root"]) / cfg["dataset"]
     pairs = collect_pairs(root / cfg["images_subdir"], root / cfg["labels_subdir"])
     info = scan_label_info(pairs,
@@ -675,20 +776,18 @@ def build_datasets(cfg):
                            mask_mode=cfg.get("mask_mode", "auto"),
                            class_names=cfg.get("class_names") or None,
                            root=root, use_cache=bool(cfg.get("label_cache", True)))
-    if len(pairs) < 2:
-        raise RuntimeError("至少需要 2 张图像才能划分训练/验证集")
+    if len(pairs) < 3:
+        raise RuntimeError("至少需要 3 张图像才能划分 训练/验证/测试集")
 
-    csv_path = find_split_csv(root, cfg.get("split_csv", "auto"))
-    split_note = None
-    if csv_path is not None:
-        train_idx, val_idx, split_note = split_by_csv(pairs, csv_path, cfg["val_ratio"], cfg["seed"])
-        print("[data] %s" % split_note)
-    else:
-        idx = list(range(len(pairs)))
-        random.Random(cfg["seed"]).shuffle(idx)
-        n_val = min(len(idx) - 1, max(1, int(round(len(idx) * cfg["val_ratio"]))))
-        val_idx, train_idx = sorted(idx[:n_val]), sorted(idx[n_val:])
-    print("[data] 共 %d 对，训练 %d / 验证 %d" % (len(pairs), len(train_idx), len(val_idx)))
+    assign, split_src = load_splits(pairs, root, cfg)
+    train_idx, val_idx, test_idx = split_indices(pairs, assign)
+    if not train_idx or not val_idx:
+        raise RuntimeError("划分后训练/验证集为空（train %d / val %d / test %d），"
+                           "请检查或删除 %s 重新生成" % (len(train_idx), len(val_idx), len(test_idx),
+                                                    cfg.get("split_file", SPLIT_FILE)))
+    print("[data] 划分来源: %s" % split_src)
+    print("[data] 共 %d 对 -> 训练 %d / 验证 %d / 测试 %d（test 本次不参与训练与验证）" % (
+        len(pairs), len(train_idx), len(val_idx), len(test_idx)))
 
     aug = {k[4:]: cfg[k] for k in cfg if k.startswith("aug_")}
     common = dict(info=info, img_size=cfg["img_size"], in_channels=cfg["in_channels"],
@@ -696,6 +795,7 @@ def build_datasets(cfg):
     train_ds = SegDataset([pairs[i] for i in train_idx], aug=aug, **common)
     val_ds = SegDataset([pairs[i] for i in val_idx], aug=None, **common)
     info = dict(info, val_files=[pairs[i][0].name for i in val_idx],
-                split=split_note or ("random(seed=%d)" % cfg["seed"]),
-                n_train=len(train_idx), n_val=len(val_idx))
+                test_files=[pairs[i][0].name for i in test_idx],
+                train_files=[pairs[i][0].name for i in train_idx],
+                split=split_src, n_train=len(train_idx), n_val=len(val_idx), n_test=len(test_idx))
     return train_ds, val_ds, info

@@ -12,9 +12,9 @@ from io import StringIO
 import cv2
 import numpy as np
 
-from dataset import (INFO_FILE, _align_names, collect_pairs, detect_mask_mode, find_split_csv,
+from dataset import (INFO_FILE, SPLIT_FILE, _align_names, collect_pairs, detect_mask_mode, find_split_csv,
                      guess_names_from_json, read_class_names, read_label_info_file, read_mask,
-                     read_split_csv)
+                     read_split_csv, read_split_txt)
 from utils import abspath, imread_unicode, parse_args
 
 # ============================ 所有参数集中在这里 ============================
@@ -25,6 +25,7 @@ DEFAULTS = {
     "max_scan": 200,             # 每个数据集最多抽样多少张 mask 统计像素值/通道（0=全部）
     "max_probe": 8,              # 最多探测多少张图像的分辨率/通道
     "split_csv": "auto",         # auto / none，是否检查数据集里的划分 csv
+    "split_file": "split.txt",   # 固定划分文件名（与 train.py 一致）
 }
 # ===========================================================================
 
@@ -216,12 +217,20 @@ def describe_mask_labels(pairs, root, max_scan):
 
 
 def describe_split(root, cfg, pairs):
+    """返回 (split.txt 的 train/val/test 计数, csv 划分信息)；都没有则 None。"""
+    out = {"split_txt": None, "csv": None}
+    names = {ip.name for ip, _ in pairs}
+    txt = read_split_txt(root / SPLIT_FILE)
+    if txt:
+        cnt = Counter(v for n, v in txt.items() if n in names)
+        out["split_txt"] = {k: cnt.get(k, 0) for k in ("train", "val", "test")}
+        out["missing"] = len(names - set(txt))
     path = find_split_csv(root, cfg.get("split_csv", "auto"))
-    if path is None:
-        return None
-    table = read_split_csv(path)
-    cats = Counter(table.get(ip.name, ("(未列出)", None))[0] for ip, _ in pairs)
-    return {"path": path, "counts": cats}
+    if path is not None:
+        table = read_split_csv(path)
+        out["csv"] = {"name": path.name,
+                      "counts": Counter(table[n][0] for n in names if n in table)}
+    return out if (out["split_txt"] or out["csv"]) else None
 
 
 # --------------------------------------------------------------------------
@@ -294,8 +303,16 @@ def print_dataset(i, n, d):
         len(d["pairs"]), d["n_img"],
         "" if len(d["pairs"]) == d["n_img"] else "（缺 %d 张）" % (d["n_img"] - len(d["pairs"]))))
     if d["split"]:
-        _kv(lines, "划分 csv", "%s   %s" % (
-            d["split"]["path"].name, "  ".join("%s=%d" % (k, v) for k, v in d["split"]["counts"].most_common())))
+        st = d["split"]["split_txt"]
+        if st:
+            _kv(lines, "数据划分", "%s   train %d / val %d / test %d%s" % (
+                SPLIT_FILE, st["train"], st["val"], st["test"],
+                "（%d 张新图不在划分里）" % d["split"]["missing"] if d["split"].get("missing") else ""))
+        cs = d["split"]["csv"]
+        if cs:
+            _kv(lines, "划分 csv", "%s   %s%s" % (
+                cs["name"], "  ".join("%s=%d" % (k, v) for k, v in cs["counts"].most_common()),
+                "（仅首次生成 split.txt 时参考）" if st else ""))
     cache = read_label_info_file(d["path"] / INFO_FILE)
     if cache:
         _kv(lines, "扫描缓存", "%s（%s 生成）—— 训练时直接复用，不用再扫 %d 个标签文件" % (

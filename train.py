@@ -19,26 +19,29 @@ import segmentation_models_pytorch as smp
 from dataset import INFO_FILE, build_datasets
 from models import benchmark_ms, build_model, count_gflops
 from utils import (abspath, imwrite_unicode, normalize, parse_args, render_prediction, resize_image,
-                   to_hw)
+                   seg_metrics, to_hw)
 
 # ============================ 所有参数集中在这里 ============================
 DEFAULTS = {
     # ---- 数据 ----
     "data_root": "data",              # 数据根目录（相对框架目录，也可写绝对路径如 E:/xxx/data）
-    "dataset": "OCT5K",                # 数据集文件夹名：<data_root>/<dataset>/{train_dataset,labels}
+    "dataset": "inner_circle_dataset",                # 数据集文件夹名：<data_root>/<dataset>/{train_dataset,labels}
     "images_subdir": "train_dataset",
     "labels_subdir": "labels",
     "json_merge_labels": False,       # labelme 里出现多个 label 名时，True=全部并成同一前景类
     "mask_mode": "auto",              # mask 标签编码：auto / index(单通道索引图) / channels(每通道=1类，AIDK 风格)
     "class_names": [],                # 可选类名（含背景也行）；空=自动读 <dataset>/classes.txt，没有则用默认名
-    "img_size": [224, 224],           # [H, W]，需为 32 的倍数。AIDK 常用 288,512；labelme 数据用 224,224 或 64,64
+    "img_size": [64, 64],           # [H, W]，需为 32 的倍数。AIDK 常用 288,512；labelme 数据用 224,224 或 64,64
     "in_channels": 1,                 # 1=灰度，3=RGB
     "num_classes": 0,                 # 含背景；0=自动（labelme 单类别 -> 2，AIDK 三通道 mask -> 4）
     "mean": [127.5],                  # 归一化 (x-mean)/std，0~255 单位；RKNN 转换会读同一组值
     "std": [127.5],
-    "val_ratio": 0.2,
-    "split_csv": "auto",              # 划分文件：auto=找 <dataset>/split/test_train_data.csv；none=纯随机；或写具体路径
-                                      # csv 列：image_id(带扩展名),category(train/test/val)，可选 fold 列（fold==0 做验证集）
+    "val_ratio": 0.2,                 # 仅用于首次生成 split.txt：验证集占比
+    "test_ratio": 0.2,                # 仅用于首次生成 split.txt：测试集占比（train.py 不碰 test，留给 predict.py 评估）
+    "split_file": "split.txt",        # 固定划分文件（相对数据集目录）；空字符串=不落盘
+    "resplit": False,                 # True = 忽略现有 split.txt 重新生成（默认固定复用，保证可比）
+    "split_csv": "auto",              # 首次生成时如有 <dataset>/split/test_train_data.csv 则沿用其 category/fold
+                                      # csv 列：image_id(带扩展名),category(train/test/val)，可选 fold 列（fold==0 做 val）
     "seed": 42,
     "cache": True,                    # 预先把全部图缩放后放进内存（大图数据集强烈建议开）
     "label_cache": True,               # 标签扫描结果缓存到 <dataset>/label_info.txt，下次训练不再重复解码 mask
@@ -116,26 +119,8 @@ def _short(name, n=12):
 
 
 def conf_metrics(conf, num_classes):
-    """混淆矩阵（行=真值，列=预测）-> 各类 dice/iou/P/R/F1 + 前景均值（不含背景，不存在的类跳过）。"""
-    conf = conf.double().cpu()
-    tp = conf.diag()
-    fp, fn = conf.sum(0) - tp, conf.sum(1) - tp
-    nan = torch.tensor(float("nan"), dtype=torch.double)
-    dice = torch.where(2 * tp + fp + fn > 0, 2 * tp / (2 * tp + fp + fn).clamp(min=1), nan)
-    iou = torch.where(tp + fp + fn > 0, tp / (tp + fp + fn).clamp(min=1), nan)
-    prec = torch.where(tp + fp > 0, tp / (tp + fp).clamp(min=1), nan)
-    rec = torch.where(tp + fn > 0, tp / (tp + fn).clamp(min=1), nan)
-
-    def fg_mean(x):
-        v = float(torch.nanmean(x[1:])) if num_classes > 1 else float("nan")
-        return 0.0 if v != v else v   # 前景类都不存在时按 0 处理，避免 best 判断失效
-
-    denom = (2 * tp + fp + fn).clamp(min=1)
-    return {"dice": dice.tolist(), "iou": iou.tolist(), "prec": prec.tolist(), "rec": rec.tolist(),
-            "f1": (2 * tp / denom).tolist(),
-            "pacc": float(tp.sum() / conf.sum().clamp(min=1)),
-            "mdice": fg_mean(dice), "miou": fg_mean(iou),
-            "mprec": fg_mean(prec), "mrec": fg_mean(rec), "mf1": fg_mean(2 * tp / denom)}
+    """torch 混淆矩阵 -> seg_metrics（指标实现统一在 utils，predict.py 复用）。"""
+    return seg_metrics(conf.double().cpu().numpy(), num_classes)
 
 
 @torch.no_grad()
@@ -271,9 +256,13 @@ def print_summary(cfg, info, train_ds, val_ds, train_loader, model, C, hw, devic
     _section("1/4 数据集")
     lines = []
     _kv(lines, "数据集", "%s   (%s)" % (cfg["dataset"], data_dir))
-    _kv(lines, "样本数", "共 %d 对  ->  训练 %d / 验证 %d   (val_ratio=%g, seed=%d)" % (
-        len(train_ds) + len(val_ds), len(train_ds), len(val_ds), cfg["val_ratio"], cfg["seed"]))
-    _kv(lines, "划分方式", "%s" % info.get("split", "random"))
+    _kv(lines, "样本数", "共 %d 对  ->  训练 %d / 验证 %d / 测试 %d" % (
+        len(train_ds) + len(val_ds) + int(info.get("n_test", 0)),
+        len(train_ds), len(val_ds), int(info.get("n_test", 0))))
+    _kv(lines, "划分方式", "%s" % info.get("split", "-"))
+    if info.get("n_test"):
+        _kv(lines, "测试集", "%d 张保留不参与训练/验证，模型定型后用 predict.py 评估（--split test）"
+            % int(info["n_test"]))
     _kv(lines, "类别数", classes_txt)
     _kv(lines, "标签编码", kind_txt)
     _kv(lines, "标签扫描", "复用缓存 %s" % info["from_cache"] if info.get("from_cache")
@@ -356,6 +345,7 @@ def run(cfg):
         "num_classes": int(C), "img_size": [hw[0], hw[1]],
         "mean": [float(v) for v in cfg["mean"]], "std": [float(v) for v in cfg["std"]],
         "dataset": cfg["dataset"], "data_root": str(cfg["data_root"]), "images_subdir": cfg["images_subdir"],
+        "labels_subdir": cfg["labels_subdir"], "json_merge_labels": bool(cfg["json_merge_labels"]),
         "kind": info["kind"], "mask_mode": info.get("mask_mode"),
         "class_values": info.get("class_values"), "label2idx": info.get("label2idx"),
         "class_names": list(info["class_names"][:int(C)]),

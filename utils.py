@@ -158,6 +158,34 @@ def overlay(img, mask, alpha=0.5):
     return out.astype(np.uint8)
 
 
+def seg_metrics(conf, num_classes):
+    """混淆矩阵（行=真值，列=预测，numpy）-> 各类 dice/iou/P/R/F1 + 前景均值 + 像素准确率。
+    train.py（训练/验证）与 predict.py（测试集评估）共用这一套指标。
+    验证/测试集里不存在的类，单项指标记 NaN，前景均值只对存在的类求平均（全不存在则记 0）。"""
+    conf = np.asarray(conf, dtype=np.float64)
+    tp = np.diag(conf)
+    fp, fn = conf.sum(0) - tp, conf.sum(1) - tp
+
+    def ratio(num, den):
+        return np.where(den > 0, num / np.maximum(den, 1e-12), np.nan)
+
+    dice = ratio(2 * tp, 2 * tp + fp + fn)
+    iou = ratio(tp, tp + fp + fn)
+    prec = ratio(tp, tp + fp)
+    rec = ratio(tp, tp + fn)
+    f1 = dice
+
+    def fg_mean(x):
+        vals = x[1:][~np.isnan(x[1:])] if num_classes > 1 else np.array([])
+        return float(vals.mean()) if vals.size else 0.0
+
+    return {"dice": dice.tolist(), "iou": iou.tolist(), "prec": prec.tolist(), "rec": rec.tolist(),
+            "f1": f1.tolist(),
+            "pacc": float(tp.sum() / max(conf.sum(), 1.0)),
+            "mdice": fg_mean(dice), "miou": fg_mean(iou),
+            "mprec": fg_mean(prec), "mrec": fg_mean(rec), "mf1": fg_mean(f1)}
+
+
 # --------------------------------------------------------------------------
 # 预测结果单图可视化：原图 + 类别半透明填充 + 同类颜色的虚线边界
 # --------------------------------------------------------------------------

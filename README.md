@@ -7,7 +7,9 @@
 data/<数据集名>/train_dataset/   图像（也可以同时放 labelme 的 .json，当标签用）
 data/<数据集名>/labels/          标签：labelme 的 .json，或 mask 图像（按文件名主干匹配）
 data/<数据集名>/classes.txt      （可选）类别名，每行一个，可含 background
-data/<数据集名>/split/test_train_data.csv （可选）划分文件：image_id,category[,fold]
+data/<数据集名>/split.txt        固定的 train/val/test 划分（自动生成，可手工改）
+data/<数据集名>/label_info.txt   标签扫描缓存（自动生成）
+data/<数据集名>/split/test_train_data.csv （可选）外部划分 csv：image_id,category[,fold]
 ```
 `data_root` 默认是本目录下的 `data`，也可在 `train.py` 的 DEFAULTS 里写绝对路径。
 
@@ -33,16 +35,37 @@ fingerprint = {"files": 768, "bytes": 10313855, "mtime": 1793152981816731400, "p
 没有 `labels/` 目录时，会自动把 `train_dataset/` 里的 labelme `.json` 当标签用。
 类名优先取 `class_names` → `classes.txt` → labelme json 里的标签名（如 inner_circle 的 `center`）→ 默认 `class_1..`。
 
-## 训练/验证划分
-| `split_csv` | 行为 |
+## 固定的三段划分：train / val / test
+**一次生成、之后永远复用**，写在 **`data/<数据集名>/split.txt`**（纯文本，可手工改）：
+```
+# segzoo 数据划分 train/val/test：自动生成，可手工修改，删除后会重新生成
+# 生成时间 2026-11-05 10:32:53 | seed=42
+# 来源: test_train_data.csv 的 train 子集按 seed=42 划分 val，csv 的 test 行作为 test
+# 共 524 张: train 378 / val 94 / test 52（train.py 只用 train+val，predict.py 默认用 test）
+# 格式: 文件名<TAB>split
+0615_new_data_out_0.jpg	train
+0615_new_data_out_102.jpg	val
+0615_new_data_out_5.jpg	test
+```
+| 脚本 | 用到哪一段 |
 |---|---|
-| `auto`（默认） | 若存在 `<dataset>/split/test_train_data.csv` 就按它划分，否则随机 |
-| `none` | 忽略 csv，全部图像按 `seed` + `val_ratio` 随机划分 |
-| 具体路径 | 用指定的 csv |
+| `train.py` / `sweep.py` | 只用 **train** 训练 + **val** 选模型/早停；**test 完全不碰** |
+| `predict.py` | 默认只在 **test** 上跑，作为最终泛化评估（算 Dice/IoU/P/R/F1） |
 
-csv 规则（与 `python_model_train` 一致）：`category=train` 参与训练，`category=test` 不参与；
-有 `val/valid` 行就直接做验证集；否则含 `fold` 列时 `fold==0` 做验证集；都没有则用 train 子集按 `seed` 随机划分。
-`inner_circle_dataset` 已附带与参考项目相同的 `split/test_train_data.csv`（472 train / 52 test）。
+生成规则（只在 split.txt 不存在时执行一次）：
+1. `<dataset>/split/test_train_data.csv` 存在 → 沿用它的 `category`：`train` 行抽一部分做 val，`test` 行做 test；有 `fold` 列则 `fold==0` 做 val
+2. 否则按 `seed` 把全部图像随机分成 **train 60% / val 20% / test 20%**（`--val_ratio` / `--test_ratio` 可改）
+
+相关参数（`train.py`）：
+| 参数 | 说明 |
+|---|---|
+| `split_file` | 划分文件，默认 `split.txt`；设空字符串则不落盘 |
+| `resplit` | `true` = 忽略现有 split.txt 重新生成（默认 False，保证不同模型可比） |
+| `val_ratio` / `test_ratio` | 只在「生成」时生效（默认 0.2 / 0.2） |
+| `split_csv` | 生成时参考的外部 csv：`auto` / `none` / 具体路径 |
+
+重新划分：删掉 `split.txt`（或 `--resplit true`）。新加的图像不在 split.txt 里时会告警并跳过——
+想让它们生效就重新生成，或手工加行。
 
 ## mask 标签的两种编码（自动识别，可用 `--mask_mode` 强制）
 | mask_mode | 适用 | 类别数 |
@@ -62,7 +85,7 @@ csv 规则（与 `python_model_train` 一致）：`category=train` 参与训练�
 | `train.py` | 训练单个模型，保存 best.pth / 日志 / 可视化 / results.json |
 | `sweep.py` | 批量对比 架构×编码器，输出排行榜与帕累托 |
 | `export_onnx.py` | best.pth → 静态 shape 的 ONNX（opset 12）并校验 |
-| `predict.py` | 无需标签的批量预测：每张图只存一张 `*_result.png`（原图 + 半透明分割色块 + 同色虚线边界 + 图例） |
+| `predict.py` | 预测 + **在 test 段做最终评估**（Dice/IoU/P/R/F1），每张图一张 `*_result.png`（原图 + 半透明色块 + 同色虚线边界） |
 | `convert_rknn.py` | ONNX → RKNN（仅 Linux/WSL2，需 rknn-toolkit2） |
 
 ## 典型流程
@@ -72,8 +95,10 @@ python make_demo_data.py
 python train.py --dataset _demo_mask --img_size 128,128 --epochs 3        # 冒烟：索引 mask
 python train.py --dataset _demo_mask_ch --img_size 128,128 --epochs 3     # 冒烟：多通道 mask
 python train.py --dataset inner_circle_dataset --img_size 224,224         # 二值 mask + csv 划分（参考项目同款数据）
-python train.py                       # 在 DEFAULTS 指定的数据集上训练
-python sweep.py                       # 批量对比
+python train.py                       # 在 DEFAULTS 指定的数据集上训练（只看 train/val）
+python sweep.py                       # 批量对比（同一份 split.txt，结果可比）
+python predict.py                     # 模型定型后：在 test 段上做最终评估 + 可视化
+python predict.py --split val         # 想看 val 的效果就用它
 python export_onnx.py && python predict.py --backend onnx
 # Linux 上：python convert_rknn.py
 ```
@@ -106,8 +131,9 @@ segzoo 训练  |  unet + resnet18 @ 128x128  |  NVIDIA GeForce RTX 4060
 ==============================================================================
 ---- [1/4 数据集] --------------------------------------------------------------
   数据集          inner_circle_dataset   (E:\lfm\segzoo\data\inner_circle_dataset)
-  样本数          共 472 对  ->  训练 378 / 验证 94   (val_ratio=0.2, seed=42)
-  划分方式        csv 的 train 子集按 seed=42 随机划分验证集
+  样本数          共 524 对  ->  训练 378 / 验证 94 / 测试 52
+  划分方式        split.txt（已存在，固定复用）
+  测试集          52 张保留不参与训练/验证，模型定型后用 predict.py 评估（--split test）
   类别数          2（含背景）  0=background  1=center
   标签编码        单通道索引图（像素值 [0, 1]）
   输入            1 通道 @ 128x128   mean=[127.5]  std=[127.5]
@@ -148,19 +174,41 @@ Epoch   3/30    lr 9.02e-04  |  训练 5s + 验证 1s = 6s  |  已用 17s  剩�
 `epoch,train_loss,val_loss,train_mdice,train_miou,mdice,miou,pacc,lr,dice_c0...`。
 进度条可用 `--progress_bar false` 关闭（非终端环境自动改成每 20% 打一行）。
 
-## 预测结果可视化（`predict.py`）
-每张图**只输出一张** `<stem>_result.png`（不再单独存 `*_mask.png` / `*_panel.png`）：
+## 预测 / 最终评估（`predict.py`）
+默认只在 **test 段**（`split.txt` 里的 test）上跑，作为模型定型后的泛化评估；有标签时直接算指标并打印表格。
+```
+python predict.py                            # 最新 best.pth，在 test 段评估 + 出图
+python predict.py --split val                # 看 val 段（调试用）
+python predict.py --split all --metrics false # 没标签的新图：全部推理，只要图
+python predict.py --max_images 8             # 只跑 8 张（默认 0 = 全部）
+python predict.py --backend onnx             # 用导出的 model.onnx 评估，顺便验证前后处理一致性
+python predict.py --save_vis false           # 只要指标，不存图（快很多）
+```
+输出：
+- 每张图一张 `<stem>_result.png`（原图 + 半透明分割色块 + 同色虚线边界 + 图例）
+- `<out_dir>/metrics_test.json`（含每类 dice/iou/P/R/F1、前景均值、像素准确率、ckpt 路径等）
+```
+==============================================================================
+最终评估（test 段）| unet_resnet18_128x128 | unet + resnet18 @ 128x128 | 统计 52 张
+------------------------------------------------------------------------------
+  cls  name           Dice     IoU      P        R        F1
+  0    background     0.9821   0.9648   0.9803   0.9839   0.9821
+  1    center         0.9432   0.8925   0.9510   0.9356   0.9432
+------------------------------------------------------------------------------
+  前景均值    Dice 0.9432  IoU 0.8925  P 0.9510  R 0.9356  F1 0.9432   像素准确率 0.9774
+==============================================================================
+```
+指标在**模型输入尺寸**上算（预测结果与最近邻缩小的 GT 逐像素比），与训练/验证时用同一套 `utils.seg_metrics`。
 
+## 预测结果可视化细节
 - 底图 = 原图（原分辨率）
 - 每个类别 = **半透明色块** + **同色虚线边界**（边界画在色块之上，线宽/虚线节奏按图像尺寸自动取）
 - 左上角图例：当前图出现的类别（颜色与虚线/色块一致，类名取自训练时的 `meta.class_names`）
 
 ```
-python predict.py                                  # 默认：最新 best.pth，前 20 张
-python predict.py --backend onnx                   # 用导出的 model.onnx 验证前后处理一致性
 python predict.py --alpha 0.3 --thickness 2        # 色块更淡 / 虚线更粗（默认 = 短边/600，即 1~2px）
 python predict.py --thickness 1                    # 强制 1px 虚线（不抗锯齿，虚线节奏更清楚）
-python predict.py --no-legend                      # 不画图例（--legend false 亦可）
+python predict.py --legend false                   # 不画图例
 python predict.py --dash 12 --gap 8                # 手动指定虚线节奏（默认按线宽自动）
 ```
 调色板来自 `utils.PALETTE`（下标=类别索引，0=背景不画），类别数超过 8 时自动用 HSV 补色。
