@@ -184,9 +184,13 @@ def seg_metrics(conf, num_classes):
     pacc = float(tp.sum() / max(total, 1.0))                          # 全部像素准确率
     acc_fg = float(tp[1:].sum() / fg_total) if fg_total > 0 else 0.0   # 只看前景像素的准确率
 
+    col_share = conf.sum(0) / max(total, 1.0)      # 预测成每一类的像素占比
+    top = int(np.argmax(col_share)) if num_classes else 0
+
     return {"dice": dice.tolist(), "iou": iou.tolist(), "prec": prec.tolist(), "rec": rec.tolist(),
             "f1": f1.tolist(),
             "pacc": pacc, "acc_fg": acc_fg, "fg_ratio": float(fg_total / max(total, 1.0)),
+            "pred_top_class": top, "pred_top_share": float(col_share[top]),
             "mdice": fg_mean(dice), "miou": fg_mean(iou),
             "mprec": fg_mean(prec), "mrec": fg_mean(rec), "mf1": fg_mean(f1)}
 
@@ -297,3 +301,134 @@ def render_prediction(img, mask, alpha=0.45, class_names=None, dash=0, gap=0, th
     if legend and class_names is not None and present:
         out = _draw_legend(out, present, colors, list(class_names), th, line_type)
     return out
+
+
+# --------------------------------------------------------------------------
+# 训练曲线：读 log.csv 画二联图（左 loss+acc，右 per-class Dice）
+# --------------------------------------------------------------------------
+def plot_training_curves(csv_path, out_path, acc_key="acc_fg", acc_label="Acc(fg)",
+                         class_names=None, best_epoch=None, title=None, hide_bg_dice=False, ylim=1.0):
+    """把 log.csv 画成一张二联图，返回图片路径或 None：
+      左：train/valid 的 loss（左轴）+ 准确率（右轴）
+      右：验证集每类 Dice（hide_bg_dice=True 时不画背景类，只看前景）
+    两个子图的 y 轴都固定到 [0, ylim]（ylim=1.0 即 0~1），超出范围的点会在图上标注数值。
+    matplotlib 不是硬依赖：没装就打印提示并跳过，不影响训练。"""
+    import csv as _csv
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        # 中文类名/数据集名也能正常显示；缺字体时自动退到 DejaVu
+        matplotlib.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "Noto Sans CJK SC",
+                                                  "WenQuanYi Zen Hei", "DejaVu Sans"]
+        matplotlib.rcParams["axes.unicode_minus"] = False
+        import matplotlib.pyplot as plt
+        from matplotlib.lines import Line2D
+    except Exception as e:      # 没装 matplotlib / 无显示环境
+        print("[warn] 画训练曲线需要 matplotlib（pip install matplotlib），已跳过: %s" % e)
+        return None
+
+    with open(csv_path, "r", encoding="utf-8") as f:
+        rows = list(_csv.DictReader(f))
+    if not rows:
+        return None
+
+    def col(name):
+        out = []
+        for r in rows:
+            try:
+                out.append(float(r.get(name)))
+            except (TypeError, ValueError):
+                out.append(float("nan"))
+        return out
+
+    def has(name):
+        return name in rows[0]
+
+    ep = [int(float(r["epoch"])) for r in rows]
+    dice_cols = [k for k in rows[0] if k.startswith("dice_c")]
+    names = list(class_names or []) + ["c%d" % i for i in range(len(dice_cols))]
+
+    fig, (ax_l, ax_r) = plt.subplots(1, 2, figsize=(13.5, 4.8), constrained_layout=True)
+    fig.suptitle(title or csv_path.stem, fontsize=13, weight="bold")
+
+    # ---------------- 左：loss（左轴） + 准确率（右轴） ----------------
+    mk_l = ax_l.axvline(best_epoch, color="#444", ls=":", lw=1.4) if best_epoch else None
+    # h1, = ax_l.plot(ep, col("train_loss"), color="#1f77b4", lw=1.6, label="train loss")
+    # h2, = ax_l.plot(ep, col("val_loss"), color="#d62728", lw=1.6, label="valid loss")
+    C_LOSS, C_ACC = "#1f77b4", "#ff7f0e"      # loss=蓝，准确率=橙；train 实线、valid 虚线
+    h1, = ax_l.plot(ep, col("train_loss"), color=C_LOSS, ls="-", lw=1.6, label="train loss")
+    h2, = ax_l.plot(ep, col("val_loss"), color=C_LOSS, ls="--", lw=1.6, label="valid loss")
+
+    ax_l.set_title("Loss & Accuracy", fontsize=11)
+    ax_l.set_xlabel("epoch")
+    # ax_l.set_ylabel("loss")
+    ax_l.set_ylabel("loss", color=C_LOSS)
+    ax_l.tick_params(axis="y", colors=C_LOSS)
+    
+    ax_l.grid(alpha=0.3)
+
+    ax_a = ax_l.twinx()
+    hs = []
+    # if has("train_" + acc_key):
+    #     hs.append(ax_a.plot(ep, col("train_" + acc_key), color="#2ca02c", lw=1.5,
+    #                         label="train " + acc_label)[0])
+    # if has(acc_key):
+    #     hs.append(ax_a.plot(ep, col(acc_key), color="#9467bd", lw=1.8,
+    #                         label="valid " + acc_label)[0])
+    if has("train_" + acc_key):
+        hs.append(ax_a.plot(ep, col("train_" + acc_key), color=C_ACC, ls="-", lw=1.6,
+                            label="train " + acc_label)[0])
+    if has(acc_key):
+        hs.append(ax_a.plot(ep, col(acc_key), color=C_ACC, ls="--", lw=1.6,
+                            label="valid " + acc_label)[0])
+    # ax_a.set_ylabel("accuracy")
+    ax_a.set_ylabel("accuracy", color=C_ACC)
+    ax_a.tick_params(axis="y", colors=C_ACC)
+    handles = [h1, h2] + hs
+    if mk_l is not None:
+        handles.append(Line2D([], [], color="#444", ls=":", label="best ep %d" % best_epoch))
+    # ax_l.legend(handles=handles, fontsize=9, loc="best")
+    # 图例放到左图右侧（"accuracy" 纵轴外面），不遮挡曲线；
+    # constrained_layout 会自动给它让出空间，右图不会被挤到
+    ax_l.legend(handles=handles, fontsize=9, loc="center right")
+
+    # y 轴固定范围（默认 0~1）；loss 超出范围的点在图上标注，避免误解成“acc 到了几十”
+    hi = float(ylim) if ylim and float(ylim) > 0 else None
+    notes = []
+    if hi:
+        ax_l.set_ylim(0, hi)
+        ax_a.set_ylim(0, 1.0)
+        for lbl, k in (("train loss", "train_loss"), ("valid loss", "val_loss")):
+            if not has(k):
+                continue
+            vals = [v for v in col(k) if v == v]
+            above = [(v, e) for v, e in zip(col(k), ep) if v == v and v > hi]
+            if above:
+                v, e = max(above)
+                notes.append("%s %.2f@ep%d%s" % (
+                    lbl, v, e, "" if len(above) <= 1 else " (+%d more)" % (len(above) - 1)))
+    if notes:
+        ax_l.text(0.01, 0.015, "clipped above %g (still in log.csv): %s" % (hi, "; ".join(notes)),
+                  transform=ax_l.transAxes, fontsize=7.5, color="#666", va="bottom")
+
+    # ---------------- 右：per-class Dice（验证集） ----------------
+    if best_epoch:
+        ax_r.axvline(best_epoch, color="#444", ls=":", lw=1.4)
+    drew = 0
+    for i, k in enumerate(dice_cols):
+        if hide_bg_dice and i == 0:          # 不画背景类
+            continue
+        ax_r.plot(ep, col(k), lw=1.6, label=str(names[i])[:14] if i < len(names) else k)
+        drew += 1
+    ax_r.set_title("Per-class Dice (valid)" + ("  —  foreground only" if hide_bg_dice else ""),
+                   fontsize=11)
+    ax_r.set_xlabel("epoch")
+    ax_r.set_ylabel("Dice")
+    ax_r.grid(alpha=0.3)
+    if drew:
+        ax_r.legend(fontsize=8, ncol=1 if drew <= 6 else 2)
+
+    fig.savefig(str(out_path), dpi=130)
+    plt.close(fig)
+    return out_path

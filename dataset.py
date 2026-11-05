@@ -658,13 +658,21 @@ def read_split_txt(path):
     return out or None
 
 
-def write_split_txt(path, pairs, assign, note, seed=None):
-    """写入固定的三段划分文件（人类可读，手改即生效；删掉会重新生成）。"""
+SPLIT_PARAM_KEYS = ("val_ratio", "test_ratio")   # 这两个参数变了会自动重新划分
+LEGACY_SPLIT_PARAMS = {"val_ratio": 0.2, "test_ratio": 0.2}   # 旧 split.txt 未记参数，按当时的默认值比对
+
+
+def write_split_txt(path, pairs, assign, note, seed=None, params=None):
+    """写入固定的三段划分文件（人类可读，手改即生效；删掉会重新生成）。
+    `params` 里记录本次真正用到的划分参数，下次训练会拿它和当前参数比对，变了就自动重划。"""
     real = {k: v for k, v in assign.items() if k in {ip.name for ip, _ in pairs}}
     cnt = {k: sum(1 for v in real.values() if v == k) for k in SPLIT_NAMES}
+    params = dict(params or {})
+    params.setdefault("seed", seed)
     lines = ["# segzoo 数据划分 train/val/test：自动生成，可手工修改，删除后会重新生成",
              "# 生成时间 %s | seed=%s" % (time.strftime("%Y-%m-%d %H:%M:%S"), seed),
              "# 来源: %s" % note,
+             "# params: %s" % json.dumps(params, sort_keys=True, ensure_ascii=False),
              "# 共 %d 张: train %d / val %d / test %d（train.py 只用 train+val，predict.py 默认用 test）"
              % (len(real), cnt["train"], cnt["val"], cnt["test"]),
              "# 格式: 文件名<TAB>split"]
@@ -679,7 +687,8 @@ def write_split_txt(path, pairs, assign, note, seed=None):
 
 def make_splits(pairs, cfg, csv_path):
     """生成三段划分：优先沿用 CSV 划分（train 池 + test 行），否则按 seed 随机划分。
-    返回 (assign, note)。"""
+    返回 (assign, note, used_params) —— used_params 只记本次真正影响结果的参数，
+    下次训练据此判断“val_ratio/test_ratio 是否变了”。"""
     names = [ip.name for ip, _ in pairs]
     val_ratio = float(cfg.get("val_ratio", 0.2))
     test_ratio = float(cfg.get("test_ratio", 0.2))
@@ -692,6 +701,7 @@ def make_splits(pairs, cfg, csv_path):
         train_pool = [n for n in names if cat_of[n][0] == "train"]
         val_given = [n for n in names if cat_of[n][0] in VAL_CATS]
         test_given = [n for n in names if cat_of[n][0] in ("test", "holdout")]
+        used = {"split_csv": csv_path.name}      # 全由 csv 决定，比例参数不参与
         if val_given:
             assign = {n: "train" for n in train_pool}
             assign.update({n: "val" for n in val_given})
@@ -704,6 +714,7 @@ def make_splits(pairs, cfg, csv_path):
                 assign.update({n: "train" for n, f in zip(train_pool, folds) if f != 0})
                 note = "%s 的 fold 列（fold==0 做 val）" % csv_path.name
             else:
+                used["val_ratio"] = val_ratio          # 只有这里用到 val_ratio
                 pool = list(train_pool)
                 random.Random(seed).shuffle(pool)
                 n_val = min(len(pool) - 1, max(1, int(round(len(pool) * val_ratio)))) if len(pool) > 1 else 0
@@ -715,7 +726,7 @@ def make_splits(pairs, cfg, csv_path):
         dropped = [n for n in names if n not in assign]
         if dropped:
             print("[data] %d 张图不在 csv 里，已忽略（示例: %s）" % (len(dropped), dropped[:3]))
-        return assign, note
+        return assign, note, used
 
     pool = list(names)
     random.Random(seed).shuffle(pool)
@@ -728,31 +739,77 @@ def make_splits(pairs, cfg, csv_path):
     assign.update({x: "val" for x in pool[n_test:n_test + n_val]})
     assign.update({x: "train" for x in pool[n_test + n_val:]})
     note = "按 seed=%d 随机划分（val_ratio=%g, test_ratio=%g）" % (seed, val_ratio, test_ratio)
-    return assign, note
+    return assign, note, {"val_ratio": val_ratio, "test_ratio": test_ratio}
+
+
+def read_split_params(path):
+    """读 split.txt 头部 `# params: {...}` 里记录的生成参数；旧文件没有就返回 None。"""
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("# params:"):
+                return json.loads(line.split(":", 1)[1].strip())
+            if line.startswith("#") or not line:
+                continue
+            break          # 已经进入数据行，说明没有 params 头
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def split_ratio_changes(path, cfg):
+    """对比当前 val_ratio / test_ratio 与 split.txt 生成时的参数。
+    返回 (变化说明列表, 是否是没记录参数的旧格式文件)；旧格式按当时的默认值 0.2/0.2 比对。"""
+    params = read_split_params(path)
+    legacy = params is None
+    if legacy:
+        params = dict(LEGACY_SPLIT_PARAMS)
+    changed = []
+    for k in SPLIT_PARAM_KEYS:
+        if k not in params:
+            continue                     # 该参数当时没参与（例如 csv 直接给了 test）
+        old = float(params[k])
+        new = float(cfg.get(k, old))
+        if abs(old - new) > 1e-9:
+            changed.append("%s: %g -> %g" % (k, old, new))
+    return changed, legacy
 
 
 def load_splits(pairs, root, cfg):
-    """读取或生成固定划分。返回 (assign{文件名: split}, 来源说明)。"""
+    """读取或生成固定划分。返回 (assign{文件名: split}, 来源说明)。
+    规则：split.txt 存在就复用；但若当前 val_ratio/test_ratio 与其生成时不同（或 --resplit），
+    则重新生成并覆盖。"""
     rel = cfg.get("split_file", SPLIT_FILE)
     path = (root / rel) if rel else None
     if path is not None and not cfg.get("resplit", False):
         table = read_split_txt(path)
         if table:
-            on_disk = {ip.name for ip, _ in pairs}
-            assign = {n: s for n, s in table.items() if n in on_disk}
-            new = sorted(on_disk - set(table))
-            gone = sorted(set(table) - on_disk)
-            if new:
-                print("[warn] %d 张图不在 split.txt 里，本次不参与（示例: %s）；"
-                      "要把它们纳入就删掉 split.txt 重新生成，或手工加行" % (len(new), new[:3]))
-            if gone:
-                print("[warn] split.txt 里 %d 张图在磁盘上找不到，已忽略" % len(gone))
-            return assign, "%s（已存在，固定复用）" % path.name
+            changed, legacy = (split_ratio_changes(path, cfg)
+                               if cfg.get("split_check_ratio", True) else ([], False))
+            if changed:
+                print("[data] val_ratio/test_ratio 与 split.txt 生成时不一致（%s），自动重新划分" % "; ".join(changed))
+                print("       若这不是你想要的结果：把 train.py 的 val_ratio/test_ratio 改成与 split.txt 一致，"
+                      "或加 --split_check_ratio false 固定沿用现有划分")
+            else:
+                if legacy:
+                    print("[data] 提示: %s 没记录生成参数，已按默认 val_ratio=%g/test_ratio=%g 比对；"
+                          "换比例或加 --resplit true 可重划" % (
+                              path.name, LEGACY_SPLIT_PARAMS["val_ratio"], LEGACY_SPLIT_PARAMS["test_ratio"]))
+                on_disk = {ip.name for ip, _ in pairs}
+                assign = {n: s for n, s in table.items() if n in on_disk}
+                new = sorted(on_disk - set(table))
+                gone = sorted(set(table) - on_disk)
+                if new:
+                    print("[warn] %d 张图不在 split.txt 里，本次不参与（示例: %s）；"
+                          "要把它们纳入就删掉 split.txt 重新生成，或手工加行" % (len(new), new[:3]))
+                if gone:
+                    print("[warn] split.txt 里 %d 张图在磁盘上找不到，已忽略" % len(gone))
+                return assign, "%s（已存在，固定复用）" % path.name
 
     csv_path = find_split_csv(root, cfg.get("split_csv", "auto"))
-    assign, note = make_splits(pairs, cfg, csv_path)
+    assign, note, used = make_splits(pairs, cfg, csv_path)
     if path is not None:
-        write_split_txt(path, pairs, assign, note, seed=cfg.get("seed"))
+        write_split_txt(path, pairs, assign, note, seed=cfg.get("seed"), params=used)
         print("[data] 已生成固定划分: %s（%s）" % (path, note))
     return assign, ("%s（新建: %s）" % (path.name, note) if path is not None else note)
 
@@ -820,6 +877,7 @@ PREP_DEFAULTS = {
     "seed": 42,
     "split_csv": "auto",        # 首次划分时若存在 <dataset>/split/test_train_data.csv 就沿用
     "split_file": "split.txt",  # 划分文件名；空字符串=不生成
+    "split_check_ratio": True,  # split.txt 记录的 val_ratio/test_ratio 与当前不一致时自动重新划分
     "resplit": False,           # True=忽略现有 split.txt 重新划分
     "rescan": False,            # True=忽略现有 label_info.txt 重新扫描标签
 }
@@ -892,7 +950,10 @@ def prepare_dataset(cfg):
             return str(path)
     train_ref = _rel(abspath(cfg["data_root"]).resolve(), root)   # train.py 的 --dataset 相对 data_root
     pred_ref = _rel(ROOT.resolve(), root)                         # predict.py 的 --input_dir 相对项目目录
-    print("完成。可以开始训练（只用 train+val）：")
+    print("完成。注意：train.py 的 val_ratio/test_ratio 要与本次划分一致（当前 val_ratio=%g, test_ratio=%g），"
+          "否则训练时会按 train.py 里的值自动重新划分" % (
+              float(cfg.get("val_ratio", 0.2)), float(cfg.get("test_ratio", 0.2))))
+    print("可以开始训练（只用 train+val）：")
     print("  python train.py --dataset %s" % train_ref)
     print("模型定型后评估泛化能力（test 段）：")
     print("  python predict.py --input_dir %s --split test" % pred_ref)

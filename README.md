@@ -56,16 +56,31 @@ fingerprint = {"files": 768, "bytes": 10313855, "mtime": 1793152981816731400, "p
 1. `<dataset>/split/test_train_data.csv` 存在 → 沿用它的 `category`：`train` 行抽一部分做 val，`test` 行做 test；有 `fold` 列则 `fold==0` 做 val
 2. 否则按 `seed` 把全部图像随机分成 **train 60% / val 20% / test 20%**（`--val_ratio` / `--test_ratio` 可改）
 
+**参数变了会自动重新划分**：`split.txt` 头部会记录生成参数
+```
+# params: {"seed": 42, "test_ratio": 0.2, "val_ratio": 0.2}
+```
+下次运行时拿它与当前的 `val_ratio` / `test_ratio` 比对，**不一致就自动重划**并打印原因：
+```
+[data] val_ratio/test_ratio 与 split.txt 生成时不一致（val_ratio: 0.2 -> 0.3），自动重新划分
+[data] 已生成固定划分: ...\data\X\split.txt（按 seed=42 随机划分（val_ratio=0.3, test_ratio=0.2））
+```
+（旧版本生成、没有 `# params` 头的文件，按当时的默认 0.2/0.2 比对。）
+
 相关参数（`train.py`）：
 | 参数 | 说明 |
 |---|---|
 | `split_file` | 划分文件，默认 `split.txt`；设空字符串则不落盘 |
-| `resplit` | `true` = 忽略现有 split.txt 重新生成（默认 False，保证不同模型可比） |
-| `val_ratio` / `test_ratio` | 只在「生成」时生效（默认 0.2 / 0.2） |
+| `split_check_ratio` | **默认 true**：记录的 val_ratio/test_ratio 与当前不一致时自动重划；`false` = 永远复用现有文件 |
+| `resplit` | `true` = 无条件重新生成 |
+| `val_ratio` / `test_ratio` | 生成时用的比例（同时会写进 `split.txt` 的 params） |
 | `split_csv` | 生成时参考的外部 csv：`auto` / `none` / 具体路径 |
 
-重新划分：删掉 `split.txt`（或 `--resplit true`）。新加的图像不在 split.txt 里时会告警并跳过——
-想让它们生效就重新生成，或手工加行。
+> ⚠️ 用 `dataset.py` 准备完划分后，记得让 `train.py` 的 `val_ratio`/`test_ratio` 与它一致，
+> 否则训练时会按 `train.py` 的值自动重新划分（日志会说明）；想强行沿用旧划分则加 `--split_check_ratio false`。
+
+重新划分：删掉 `split.txt`、改 `val_ratio`/`test_ratio`、或 `--resplit true`。新加的图像不在
+`split.txt` 里时会告警并跳过——想让它们生效就重新生成，或手工加行。
 
 ## mask 标签的两种编码（自动识别，可用 `--mask_mode` 强制）
 | mask_mode | 适用 | 类别数 |
@@ -83,7 +98,7 @@ fingerprint = {"files": 768, "bytes": 10313855, "mtime": 1793152981816731400, "p
 | `dataset.py` | **只生成数据集的 `label_info.txt` + `split.txt`**（不训练）：`python dataset.py` 后输入数据集路径 |
 | `inspect_data.py` | 探测 `data/` 下所有数据集：标签形式（json / png 单通道索引 / png 多通道 one-hot）、类别、数量、尺寸、磁盘占用 |
 | `make_demo_data.py` | 生成合成数据（索引 mask / 多通道 mask / labelme json），冒烟测试流程 |
-| `train.py` | 训练单个模型，保存 best.pth / 日志 / 可视化 / results.json |
+| `train.py` | 训练单个模型，保存 best.pth / 日志 / **curves.png 曲线图** / 可视化 / results.json |
 | `sweep.py` | 批量对比 架构×编码器，输出排行榜与帕累托 |
 | `export_onnx.py` | best.pth → 静态 shape 的 ONNX（opset 12）并校验 |
 | `predict.py` | 预测 + **在 test 段做最终评估**（Dice/IoU/P/R/F1），每张图一张 `*_result.png`（原图 + 半透明色块 + 同色虚线边界） |
@@ -148,7 +163,7 @@ segzoo 训练  |  unet + resnet18 @ 128x128  |  NVIDIA GeForce RTX 4060
   损失/精度       loss=ce_dice  AMP=True  batch=32  num_workers=0  cache=True
 ---- [4/4 输出] ----------------------------------------------------------------
   目录            E:\lfm\segzoo\runs\inner_circle_dataset\unet_resnet18_128x128
-  产物            best.pth / last.pth / log.csv / results.json / vis/val_XXX.png
+  产物            best.pth / last.pth / log.csv / results.json / curves.png / vis/val_XXX.png
 ==============================================================================
 
   train [################--------] 9/12  75%  loss 0.1523  0m04s<0m01s   <- 进度条（progress_bar）
@@ -179,9 +194,28 @@ Epoch   3/30    lr 9.02e-04  |  训练 5s + 验证 1s = 6s  |  已用 17s  剩�
   - `true`（默认）→ 列名变 `Acc(fg)`，只统计前景像素，前景只占 10% 时也能反映真实水平
   - `false` → 列名是 `Acc`，含背景的像素准确率
 - 每个 epoch 同时打印训练集与验证集（便于判断过拟合）
-- `log.csv` 同时记两种口径：`epoch,train_loss,val_loss,train_mdice,train_miou,mdice,miou,pacc,acc_fg,lr,dice_c0...`；
-  `results.json` 里有 `pacc` / `acc_fg` / `fg_ratio`（前景像素占比）
+- `log.csv` 同时记两种口径：`epoch,train_loss,val_loss,train_mdice,train_miou,train_pacc,train_acc_fg,
+  mdice,miou,pacc,acc_fg,lr,dice_c0...`；`results.json` 里有 `pacc` / `acc_fg` / `fg_ratio`（前景像素占比）
 - 进度条可用 `--progress_bar false` 关闭（非终端环境自动改成每 20% 打一行）
+- `--label_smoothing 0.05`：给 CE 加 label smoothing。CE 的 `-log p` 没有上界，模型早期“自信地全判成前景”时
+  单像素惩罚可达 30+，会把整个验证集均值拉到几十；开一点平滑即可压住这种尖峰
+- 出现「验证集预测里 >95% 像素都判成同一类 / 像素准确率不高于前景占比」时，日志会自动打一行 `[!] 模型可能塌缩`
+  提示（此时 `Acc(fg)` 会虚高到 ~1，而全部像素准确率只有前景占比那么大，两者一起看才准）
+
+### 训练曲线图 `curves.png`
+训练结束自动把 `log.csv` 画成一张**二联图**（`--curve_plot false` 可关）：
+
+| 子图 | 内容 |
+|---|---|
+| 左：**Loss & Accuracy** | train / valid 的 loss（**左轴**）+ train / valid 的准确率（**右轴**，口径由 `acc_exclude_bg` 决定）；两个轴的 **y 范围都固定 0~1** |
+| 右：**Per-class Dice (valid)** | 每个类别一条曲线；`acc_exclude_bg=True`（默认）时**不画背景类**，只看前景各类 |
+
+虚线竖线标出 `best_epoch`（选模型的那一轮）。超出 0~1 的点不画出来，但会在左下角注明
+`clipped above 1 (still in log.csv): valid loss 34.93@ep1 (+2 more)`，原始数值始终在 `log.csv` 里。
+`--curve_ylim 0` 可恢复自动缩放。给老 run 补画（log.csv 已存在时）：
+```bash
+python -c "import json,torch;from utils import plot_training_curves as f;d=r'runs/OCT5K/unet_resnet18_224x224';m=torch.load(d+'/best.pth',map_location='cpu',weights_only=False)['meta'];f(d+'/log.csv', d+'/curves.png', class_names=m['class_names'], hide_bg_dice=True,   best_epoch=json.load(open(d+'/results.json'))['best_epoch'])"
+```
 
 ## 预测 / 最终评估（`predict.py`）
 `--input_dir` 支持三种情况，代码会自动识别：

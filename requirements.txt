@@ -6,3 +6,4 @@ segmentation-models-pytorch==0.3.4
 huggingface_hub<0.26
 onnx
 onnxruntime
+matplotlib          # 训练结束画 loss / 准确率 / mDice / 各类 Dice 曲线图（curves.png）
