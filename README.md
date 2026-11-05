@@ -11,6 +11,25 @@ data/<数据集名>/split/test_train_data.csv （可选）划分文件：image_i
 ```
 `data_root` 默认是本目录下的 `data`，也可在 `train.py` 的 DEFAULTS 里写绝对路径。
 
+## 标签扫描缓存（`label_info.txt`）
+第一次训练会解码全部 mask 统计类别（AIDK 768 张约 18s），结果写入 **`data/<数据集名>/label_info.txt`**，
+之后每次训练直接复用（毫秒级）。文件是 `key = value`（value 为 JSON）的纯文本，可看可改可删：
+```
+# segzoo 标签扫描缓存：自动生成，删除后下次训练会重新扫描（手改 classes.txt 优先）
+version = 1
+generated = 2026-11-05 09:46:08
+kind = "mask"
+mask_mode = "channels"
+num_classes = 4
+class_names = ["background", "Cornea", "Iris", "Lesion"]
+channel_map = [0, 1, 2]
+fingerprint = {"files": 768, "bytes": 10313855, "mtime": 1793152981816731400, "pairs": 768}
+```
+- 缓存里带了标签目录指纹（文件数/总字节/最大 mtime），**换了标签或重新生成 mask 会自动重扫**
+- `classes.txt` / `--class_names` 的优先级高于缓存：改了类名不需要删缓存
+- `--mask_mode index|channels` 强制指定编码时会绕过缓存
+- `--label_cache false` 强制重新扫描（不读缓存，扫完仍会刷新缓存文件）
+
 没有 `labels/` 目录时，会自动把 `train_dataset/` 里的 labelme `.json` 当标签用。
 类名优先取 `class_names` → `classes.txt` → labelme json 里的标签名（如 inner_circle 的 `center`）→ 默认 `class_1..`。
 
@@ -43,7 +62,7 @@ csv 规则（与 `python_model_train` 一致）：`category=train` 参与训练�
 | `train.py` | 训练单个模型，保存 best.pth / 日志 / 可视化 / results.json |
 | `sweep.py` | 批量对比 架构×编码器，输出排行榜与帕累托 |
 | `export_onnx.py` | best.pth → 静态 shape 的 ONNX（opset 12）并校验 |
-| `predict.py` | 无需标签的批量预测可视化（torch 或 onnx 后端） |
+| `predict.py` | 无需标签的批量预测：每张图只存一张 `*_result.png`（原图 + 半透明分割色块 + 同色虚线边界 + 图例） |
 | `convert_rknn.py` | ONNX → RKNN（仅 Linux/WSL2，需 rknn-toolkit2） |
 
 ## 典型流程
@@ -102,7 +121,7 @@ segzoo 训练  |  unet + resnet18 @ 128x128  |  NVIDIA GeForce RTX 4060
   损失/精度       loss=ce_dice  AMP=True  batch=32  num_workers=0  cache=True
 ---- [4/4 输出] ----------------------------------------------------------------
   目录            E:\lfm\segzoo\runs\inner_circle_dataset\unet_resnet18_128x128
-  产物            best.pth / last.pth / log.csv / results.json / vis/*.png
+  产物            best.pth / last.pth / log.csv / results.json / vis/val_XXX.png
 ==============================================================================
 
   train [################--------] 9/12  75%  loss 0.1523  0m04s<0m01s   <- 进度条（progress_bar）
@@ -121,10 +140,42 @@ Epoch   3/30    lr 9.02e-04  |  训练 5s + 验证 1s = 6s  |  已用 17s  剩�
   各类 Dice       background 0.998 | center 0.890
   效率            14.322 M 参数  |  2.652 GFLOPs  |  14.34 ms/张 (cuda)
   输出            E:\lfm\segzoo\runs\inner_circle_dataset\unet_resnet18_128x128
-  产物            best.pth  last.pth  log.csv  results.json  vis/*.png
+  产物            best.pth  last.pth  log.csv  results.json  vis/val_XXX.png
 ==============================================================================
 ```
 指标说明：`mDice`/`mIoU` 是**前景类平均**（不含背景 0，验证集里不存在的类跳过）；`Acc` 是像素准确率；
 每个 epoch 同时打印训练集与验证集指标（便于看是否过拟合）；`log.csv` 记录
 `epoch,train_loss,val_loss,train_mdice,train_miou,mdice,miou,pacc,lr,dice_c0...`。
 进度条可用 `--progress_bar false` 关闭（非终端环境自动改成每 20% 打一行）。
+
+## 预测结果可视化（`predict.py`）
+每张图**只输出一张** `<stem>_result.png`（不再单独存 `*_mask.png` / `*_panel.png`）：
+
+- 底图 = 原图（原分辨率）
+- 每个类别 = **半透明色块** + **同色虚线边界**（边界画在色块之上，线宽/虚线节奏按图像尺寸自动取）
+- 左上角图例：当前图出现的类别（颜色与虚线/色块一致，类名取自训练时的 `meta.class_names`）
+
+```
+python predict.py                                  # 默认：最新 best.pth，前 20 张
+python predict.py --backend onnx                   # 用导出的 model.onnx 验证前后处理一致性
+python predict.py --alpha 0.3 --thickness 2        # 色块更淡 / 虚线更粗（默认 = 短边/600，即 1~2px）
+python predict.py --thickness 1                    # 强制 1px 虚线（不抗锯齿，虚线节奏更清楚）
+python predict.py --no-legend                      # 不画图例（--legend false 亦可）
+python predict.py --dash 12 --gap 8                # 手动指定虚线节奏（默认按线宽自动）
+```
+调色板来自 `utils.PALETTE`（下标=类别索引，0=背景不画），类别数超过 8 时自动用 HSV 补色。
+虚线是用弧长重采样画的（OpenCV 没有原生虚线），所以任意形状的轮廓都是均匀虚线。
+
+## 验证集可视化（`train.py` 的 `vis/`）
+训练结束后按 `vis_samples` 抽验证集样本，每张**只存一张** `vis/val_007.png`，一图同时给出 GT 与预测：
+
+| 元素 | 含义 |
+|---|---|
+| 底图 | 原图（**原分辨率**，预测结果最近邻放大回原图尺寸后再叠加，和 `predict.py` 一致） |
+| **半透明色块** | **预测结果**（按类别上色） |
+| **同色虚线边界** | **真值 mask**（GT） |
+| 左上图例 | 当前图出现的类别（GT 或预测里出现即列出） |
+
+所以「色块与虚线重合」= 预测正确；虚线露出色块外 = 漏检；只有色块没有虚线 = 误检。
+渲染与 `predict.py` 共用 `utils.render_prediction(..., edge_mask=gt)`；
+色块透明度用 `--vis_alpha`（默认 0.45，同 `predict.py --alpha`）。

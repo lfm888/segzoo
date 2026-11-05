@@ -156,3 +156,110 @@ def overlay(img, mask, alpha=0.5):
     fg = (mask > 0)[..., None]
     out = np.where(fg, base * (1 - alpha) + col * alpha, base)
     return out.astype(np.uint8)
+
+
+# --------------------------------------------------------------------------
+# 预测结果单图可视化：原图 + 类别半透明填充 + 同类颜色的虚线边界
+# --------------------------------------------------------------------------
+def palette(n):
+    """返回 n 个 BGR 颜色（下标 = 类别索引）；PALETTE 不够时用 HSV 均匀补。"""
+    n = max(int(n), 1)
+    out = [tuple(int(v) for v in PALETTE[i]) for i in range(min(n, len(PALETTE)))]
+    for i in range(len(PALETTE), n):
+        hsv = np.uint8([[[int((i * 47) % 180), 220, 255]]])
+        b, g, r = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0]
+        out.append((int(b), int(g), int(r)))
+    return out
+
+
+def _point_at(pts, arc, t):
+    """在弧长 t 处的插值点"""
+    j = int(np.clip(np.searchsorted(arc, t, side="right") - 1, 0, len(pts) - 2))
+    seg = arc[j + 1] - arc[j]
+    r = 0.0 if seg <= 1e-6 else (t - arc[j]) / seg
+    return pts[j] + (pts[j + 1] - pts[j]) * float(np.clip(r, 0, 1))
+
+
+def _dash_polyline(img, cnt, color, thickness, dash, gap, line_type=cv2.LINE_AA):
+    """按弧长把轮廓拆成「实线段 + 空白」画成虚线（OpenCV 没有内置虚线）。"""
+    pts = np.asarray(cnt, np.float32).reshape(-1, 2)
+    if len(pts) < 2:
+        return
+    if np.allclose(pts[0], pts[-1]):      # 闭合轮廓：去掉重复终点
+        pts = pts[:-1]
+    if len(pts) < 3:
+        return
+    pts = np.vstack([pts, pts[0]])
+    arc = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(pts, axis=0), axis=1))])
+    total, period = float(arc[-1]), float(dash + gap)
+    t = 0.0
+    while t < total:
+        a, b = t, min(t + dash, total)
+        i0 = int(np.searchsorted(arc, a, side="right") - 1)
+        i1 = int(np.searchsorted(arc, b, side="right") - 1)
+        seg = [_point_at(pts, arc, a)] + list(pts[max(i0 + 1, 1):i1 + 1]) + [_point_at(pts, arc, b)]
+        seg = np.round(np.array(seg, np.float32)).astype(np.int32)
+        if len(seg) >= 2:
+            cv2.polylines(img, [seg], False, color, thickness, line_type)
+        t += period
+
+
+def _ascii(s, n=16):
+    s = "".join(c if 32 <= ord(c) < 127 else "?" for c in str(s))
+    return s if len(s) <= n else s[: n - 1] + "~"
+
+
+def _draw_legend(img, present, colors, names, thickness, line_type=cv2.LINE_AA):
+    """左上角图例：虚线小样 + 类别序号/名称（只列当前图里出现的类），字号随图像尺寸缩放。"""
+    h, w = img.shape[:2]
+    sc = float(np.clip(min(h, w) / 600.0, 0.5, 2.2))
+    font, fs, th_txt = cv2.FONT_HERSHEY_SIMPLEX, 0.45 * sc, max(1, int(round(sc)))
+    pad, lh, sw = int(6 * sc), int(18 * sc), int(26 * sc)
+    labels = ["%d %s" % (c, _ascii(names[c] if c < len(names) else "class_%d" % c)) for c in present]
+    tw = max(cv2.getTextSize(t, font, fs, th_txt)[0][0] for t in labels)
+    w_box, h_box = min(tw + sw + 2 * pad, w), min(lh * len(labels) + 2 * pad, h)
+    roi = img[0:h_box, 0:w_box].astype(np.float32)
+    img[0:h_box, 0:w_box] = (roi * 0.35).astype(np.uint8)   # 半透明黑底，保证文字可读
+    for i, (c, txt) in enumerate(zip(present, labels)):
+        y = pad + lh * i + lh // 2
+        if y + lh // 2 >= h_box:
+            break
+        cv2.line(img, (pad, y), (pad + int(14 * sc), y), colors[c], max(1, thickness), line_type)
+        cv2.putText(img, txt, (pad + sw - int(6 * sc), y + int(5 * sc)), font, fs, colors[c], th_txt, cv2.LINE_AA)
+    return img
+
+
+def render_prediction(img, mask, alpha=0.45, class_names=None, dash=0, gap=0, thickness=None, legend=True,
+                      edge_mask=None):
+    """一张图同时表示原图 / 轮廓 / 分割结果：
+      - 每个前景类在原图上用**半透明色填充**（来自 mask = 预测结果）
+      - 每类的**边界用同色虚线**画在填充之上（默认也取自 mask；传 edge_mask 就用它，
+        典型用法：色块=预测、虚线=真值，一张图直接看预测与 GT 的偏差）
+    返回 BGR uint8。img 可以是 load_image 的结果（灰度/RGB）或 resize 后的图，mask 与之同尺寸。
+    """
+    out = to_bgr(img).astype(np.float32)
+    edge = mask if edge_mask is None else edge_mask
+    n_cls = int(max(mask.max(), edge.max())) + 1
+    colors = palette(n_cls)
+    fill_cls = [c for c in range(1, n_cls) if (mask == c).any()]
+    edge_cls = [c for c in range(1, n_cls) if (edge == c).any()]
+    present = sorted(set(fill_cls) | set(edge_cls))
+    for c in fill_cls:                                    # 半透明填充（预测）
+        m = mask == c
+        out[m] = out[m] * (1.0 - alpha) + np.array(colors[c], np.float32) * alpha
+    out = np.clip(out, 0, 255).astype(np.uint8)
+
+    h, w = out.shape[:2]
+    th = int(thickness) if thickness else max(1, int(round(min(h, w) / 600.0)))
+    dash = int(dash) if dash and dash > 0 else max(7, 5 * th)     # 虚线：细而能看出节奏
+    gap = int(gap) if gap and gap > 0 else max(5, 3 * th)
+    line_type = cv2.LINE_8 if th <= 1 else cv2.LINE_AA          # 1 像素线不要抗锯齿，否则虚线看不出间隔
+    for c in edge_cls:                                    # 同色虚线边界（默认=预测，可换成真值）
+        m = (edge == c).astype(np.uint8)
+        cnts = cv2.findContours(m, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)[0]
+        for cnt in cnts:
+            if len(cnt) >= 6 and cv2.arcLength(cnt, True) >= 8:
+                _dash_polyline(out, cnt, colors[c], th, dash, gap, line_type)
+    if legend and class_names is not None and present:
+        out = _draw_legend(out, present, colors, list(class_names), th, line_type)
+    return out

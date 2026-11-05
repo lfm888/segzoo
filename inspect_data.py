@@ -12,8 +12,9 @@ from io import StringIO
 import cv2
 import numpy as np
 
-from dataset import (_align_names, collect_pairs, detect_mask_mode, find_split_csv,
-                     guess_names_from_json, read_class_names, read_mask, read_split_csv)
+from dataset import (INFO_FILE, _align_names, collect_pairs, detect_mask_mode, find_split_csv,
+                     guess_names_from_json, read_class_names, read_label_info_file, read_mask,
+                     read_split_csv)
 from utils import abspath, imread_unicode, parse_args
 
 # ============================ 所有参数集中在这里 ============================
@@ -295,6 +296,12 @@ def print_dataset(i, n, d):
     if d["split"]:
         _kv(lines, "划分 csv", "%s   %s" % (
             d["split"]["path"].name, "  ".join("%s=%d" % (k, v) for k, v in d["split"]["counts"].most_common())))
+    cache = read_label_info_file(d["path"] / INFO_FILE)
+    if cache:
+        _kv(lines, "扫描缓存", "%s（%s 生成）—— 训练时直接复用，不用再扫 %d 个标签文件" % (
+            INFO_FILE, cache.get("generated", "?"), d["lab"]["n_files"]))
+    else:
+        _kv(lines, "扫描缓存", "无（首次训练时会自动生成 %s）" % INFO_FILE)
     _kv(lines, "磁盘合计", fmt_bytes(d["total_bytes"]))
     print("\n".join(lines))
 

@@ -10,14 +10,16 @@ import sys
 import time
 
 import numpy as np
+import cv2
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import segmentation_models_pytorch as smp
 
-from dataset import build_datasets
+from dataset import INFO_FILE, build_datasets
 from models import benchmark_ms, build_model, count_gflops
-from utils import abspath, imwrite_unicode, normalize, overlay, parse_args, to_bgr, to_hw
+from utils import (abspath, imwrite_unicode, normalize, parse_args, render_prediction, resize_image,
+                   to_hw)
 
 # ============================ 所有参数集中在这里 ============================
 DEFAULTS = {
@@ -39,12 +41,13 @@ DEFAULTS = {
                                       # csv 列：image_id(带扩展名),category(train/test/val)，可选 fold 列（fold==0 做验证集）
     "seed": 42,
     "cache": True,                    # 预先把全部图缩放后放进内存（大图数据集强烈建议开）
+    "label_cache": True,               # 标签扫描结果缓存到 <dataset>/label_info.txt，下次训练不再重复解码 mask
     # ---- 模型 ----
     "arch": "unet",                   # unet / fpn / linknet / pan / unetplusplus / manet / deeplabv3plus ...
     "encoder": "resnet18",            # resnet18 / resnet34 / mobilenet_v2 / tu-xxx(timm 模型) ...
     "encoder_weights": "imagenet",    # imagenet 或 none（下载失败会自动退回 none 并提示）
     # ---- 训练 ----
-    "epochs": 10,
+    "epochs": 3,
     "batch_size": 8,
     "lr": 1e-3,
     "weight_decay": 1e-4,
@@ -53,7 +56,8 @@ DEFAULTS = {
     "num_workers": 0,                 # 数据已缓存且增强很轻，Windows 下 0 最省事
     "device": "auto",                 # auto / cuda / cpu
     "progress_bar": True,             # 每个 epoch 内的进度条（终端里原地刷新，非终端每 20% 打一行）
-    "vis_samples": 8,                 # 训练结束后保存多少张验证集可视化
+    "vis_samples": 8,                 # 训练结束后保存多少张验证集可视化（虚线=真值，色块=预测，一张图对比）
+    "vis_alpha": 0.45,                # 可视化里分割色块的透明度
     # ---- 数据增强（概率或幅度，设 0 即关闭）----
     "aug_hflip": 0.5,
     "aug_vflip": 0.0,                 # 解剖结构有上下方向（如眼前节）时保持 0
@@ -199,18 +203,22 @@ def _clean(v):
 
 
 @torch.no_grad()
-def save_vis(model, ds, meta, out_dir, device, n):
-    """每张保存 [原图 | 真值叠加 | 预测叠加]"""
+def save_vis(model, ds, meta, out_dir, device, n, alpha=0.45):
+    """验证集可视化，一张图对比 GT 与预测，尺寸与 predict.py 一致（都是原图分辨率）：
+      虚线边界 = 真值 mask（同色）；半透明色块 = 预测结果（放大回原图尺寸）；底图 = 原图。"""
     if n <= 0:
         return
     out_dir.mkdir(parents=True, exist_ok=True)
     model.eval()
+    names = meta.get("class_names")
     for i in np.linspace(0, len(ds) - 1, min(n, len(ds))).astype(int):
-        img, mask = ds.get_raw(int(i))
-        x = torch.from_numpy(normalize(img, meta["mean"], meta["std"]))[None].to(device)
+        raw, mask = ds.get_full(int(i))          # 原分辨率的图与 GT
+        x = torch.from_numpy(normalize(resize_image(raw, ds.hw), meta["mean"], meta["std"]))[None].to(device)
         pred = model(x).argmax(1)[0].cpu().numpy().astype(np.uint8)
-        panel = np.hstack([to_bgr(img), overlay(img, mask), overlay(img, pred)])
-        imwrite_unicode(out_dir / ("val_%03d.png" % i), panel)
+        # 和 predict.py 一致：预测放大回原图尺寸（最近邻，不产生新类别）
+        full = cv2.resize(pred, (raw.shape[1], raw.shape[0]), interpolation=cv2.INTER_NEAREST)
+        vis = render_prediction(raw, full, alpha=alpha, class_names=names, edge_mask=mask)
+        imwrite_unicode(out_dir / ("val_%03d.png" % i), vis)
 
 
 W = 78  # 打印行宽
@@ -268,6 +276,8 @@ def print_summary(cfg, info, train_ds, val_ds, train_loader, model, C, hw, devic
     _kv(lines, "划分方式", "%s" % info.get("split", "random"))
     _kv(lines, "类别数", classes_txt)
     _kv(lines, "标签编码", kind_txt)
+    _kv(lines, "标签扫描", "复用缓存 %s" % info["from_cache"] if info.get("from_cache")
+        else "本次重新扫描（已缓存到 %s）" % INFO_FILE)
     _kv(lines, "输入", "%d 通道 @ %dx%d   mean=%s  std=%s" % (
         cfg["in_channels"], hw[0], hw[1], cfg["mean"], cfg["std"]))
     print("\n".join(lines))
@@ -293,7 +303,7 @@ def print_summary(cfg, info, train_ds, val_ds, train_loader, model, C, hw, devic
     _section("4/4 输出")
     lines = []
     _kv(lines, "目录", "%s" % run_dir)
-    _kv(lines, "产物", "best.pth / last.pth / log.csv / results.json / vis/*.png")
+    _kv(lines, "产物", "best.pth / last.pth / log.csv / results.json / vis/val_XXX.png")
     print("\n".join(lines))
     print("=" * W + "\n")
     return total / 1e6, gflops
@@ -424,7 +434,8 @@ def run(cfg):
     # 用最佳权重做可视化与效率统计
     ck = torch.load(str(run_dir / "best.pth"), map_location="cpu")
     model.load_state_dict(ck["model"])
-    save_vis(model, val_ds, meta, run_dir / "vis", device, int(cfg["vis_samples"]))
+    save_vis(model, val_ds, meta, run_dir / "vis", device, int(cfg["vis_samples"]),
+             alpha=float(cfg.get("vis_alpha", 0.45)))
     shape = (1, int(cfg["in_channels"]), hw[0], hw[1])
     results = {
         "name": name, "arch": cfg["arch"], "encoder": cfg["encoder"], "img_size": [hw[0], hw[1]],
@@ -457,7 +468,7 @@ def run(cfg):
     _kv(lines, "效率", "%.3f M 参数  |  %.3f GFLOPs  |  %.2f ms/张 (%s)" % (
         results["params_m"], results["gflops"], results["latency_ms"], device.type))
     _kv(lines, "输出", "%s" % run_dir)
-    _kv(lines, "产物", "best.pth  last.pth  log.csv  results.json  vis/*.png")
+    _kv(lines, "产物", "best.pth  last.pth  log.csv  results.json  vis/val_XXX.png（虚线=GT, 色块=预测）")
     print("\n".join(lines))
     print("=" * W)
     return results

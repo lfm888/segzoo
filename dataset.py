@@ -21,6 +21,7 @@
 """
 import json
 import random
+import time
 from pathlib import Path
 
 import cv2
@@ -34,6 +35,8 @@ MASK_SUFFIXES = ["", "_mask", "_label", "_labels", "_gt", "_seg", "-mask", "-lab
 CLASS_FILES = ("classes.txt", "classes.json")  # 可选的类别名文件
 SPLIT_CSV_CANDIDATES = ("split/test_train_data.csv", "test_train_data.csv", "split/train_val_test.csv")
 MAX_INDEX_CLASSES = 64   # 索引图里超过这么多种像素值，就当成二值 mask（>0=前景）
+INFO_FILE = "label_info.txt"   # 标签扫描缓存（自动生成）
+INFO_VERSION = 1
 BG_NAMES = ("background", "bg", "backgrounds", "背景", "0", "none", "unlabeled")
 
 
@@ -340,9 +343,117 @@ def _scan_index_masks(pairs, names):
             "class_names": cls_names, "class_values": class_values, "binary": binary}
 
 
-def scan_label_info(pairs, merge_json_labels=False, mask_mode="auto", class_names=None):
-    """扫描标签，返回 info：kind / mask_mode / num_classes / class_names / class_values / label2idx。"""
-    root = pairs[0][1].parent.parent          # <dataset>/
+# --------------------------------------------------------------------------
+# 标签扫描缓存：<dataset>/label_info.txt（自动生成，手改/删除都安全）
+#   首次扫描要解码全部 mask（AIDK 768 张约 18s），结果存下来以后直接复用。
+#   文件里记了标签目录的指纹（文件数/总字节/最大 mtime），标签改了会自动重扫。
+# --------------------------------------------------------------------------
+def label_fingerprint(pairs):
+    lab_dir = pairs[0][1].parent
+    n, total, mx = 0, 0, 0
+    for p in lab_dir.iterdir():
+        if p.is_file():
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            n += 1
+            total += st.st_size
+            mx = max(mx, st.st_mtime_ns)
+    return {"files": n, "bytes": total, "mtime": int(mx), "pairs": len(pairs)}
+
+
+def read_label_info_file(path):
+    """读 key = value（value 为 JSON）格式的缓存，异常/格式不对就当作没有缓存。"""
+    if not path.is_file():
+        return None
+    try:
+        out = {}
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            try:
+                out[k.strip()] = json.loads(v.strip())
+            except ValueError:
+                out[k.strip()] = v.strip()
+        return out
+    except OSError:
+        return None
+
+
+def write_label_info_file(path, info, fp, mask_mode, merge_json_labels):
+    """把扫描结果（含指纹）写成人类可读的 txt。"""
+    keep = {"kind", "mask_mode", "num_classes", "class_names", "class_values", "label2idx",
+            "channel_map", "channels", "binary", "overlap_ratio", "merged"}
+    lines = ["# segzoo 标签扫描缓存：自动生成，删除后下次训练会重新扫描（手改 classes.txt 优先）",
+             "version = %d" % INFO_VERSION,
+             "generated = %s" % time.strftime("%Y-%m-%d %H:%M:%S"),
+             "json_merge_labels = %s" % json.dumps(bool(merge_json_labels)),
+             "scan_mask_mode = %s" % json.dumps(str(mask_mode))]
+    for k in sorted(keep):
+        if k in info:
+            lines.append("%s = %s" % (k, json.dumps(info[k], ensure_ascii=False)))
+    lines.append("fingerprint = %s" % json.dumps(fp))
+    try:
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError as e:
+        print("[warn] 标签扫描缓存写入失败（不影响训练）: %s" % e)
+
+
+def apply_class_names(info, root, cfg_names=None):
+    """最终确定类名：cfg 的 class_names > classes.txt/classes.json > 缓存/扫描结果。"""
+    names = list(cfg_names) if cfg_names else read_class_names(root)
+    if not names:
+        return info
+    if info["kind"] == "json":
+        if info.get("merged"):
+            return info
+        found = list(info["label2idx"])
+        fg = [n for n in names if n.lower() not in BG_NAMES]
+        if fg:  # classes.txt 给出的顺序优先，保证类别索引稳定
+            order = [n for n in fg if n in found] + [n for n in found if n not in fg]
+            info["label2idx"] = {n: i + 1 for i, n in enumerate(order)}
+            info["class_names"] = ["background"] + order
+            print("[data] 按 classes.txt/参数 重排 labelme 类别顺序: %s" % info["label2idx"])
+        return info
+    info["class_names"] = _align_names(names, info["num_classes"], info.get("mask_mode") or "index")
+    return info
+
+
+def scan_label_info(pairs, merge_json_labels=False, mask_mode="auto", class_names=None,
+                    root=None, use_cache=True):
+    """扫描标签，返回 info：kind / mask_mode / num_classes / class_names / class_values / label2idx。
+    结果缓存到 <dataset>/label_info.txt，下次直接复用（标签目录指纹变了才重扫）。"""
+    root = Path(root) if root is not None else pairs[0][1].parent.parent   # <dataset>/
+    cache_path = root / INFO_FILE
+    fp = label_fingerprint(pairs)
+
+    if use_cache and str(mask_mode) == "auto":              # 手动指定 mask_mode 时不读缓存
+        cached = read_label_info_file(cache_path)
+        if (cached and int(cached.get("version", 0)) == INFO_VERSION
+                and cached.get("fingerprint") == fp
+                and cached.get("json_merge_labels") == bool(merge_json_labels)
+                and cached.get("kind") in ("mask", "json")):
+            info = {k: cached[k] for k in
+                    ("kind", "mask_mode", "num_classes", "class_names", "class_values",
+                     "label2idx", "channel_map", "channels", "binary", "overlap_ratio", "merged") if k in cached}
+            print("[data] 复用标签扫描缓存 %s（%s 类别 %d: %s）" % (
+                cache_path.name, cached.get("generated", ""), info["num_classes"], info["class_names"]))
+            info["from_cache"] = cache_path.name
+            return apply_class_names(info, root, class_names)
+
+    info = _scan_label_info(pairs, merge_json_labels, mask_mode, class_names, root)
+    info["from_cache"] = None
+    if str(mask_mode) == "auto":        # 强制指定 mask_mode 时不写入（避免污染 auto 的缓存）
+        write_label_info_file(cache_path, info, fp, mask_mode, merge_json_labels)
+        print("[data] 标签扫描结果已缓存: %s（下次训练直接复用）" % cache_path)
+    return apply_class_names(info, root, class_names)
+
+
+def _scan_label_info(pairs, merge_json_labels, mask_mode, class_names, root):
+    """真正去解码标签的扫描（慢），结果会被 scan_label_info 缓存。"""
     names = list(class_names) if class_names else read_class_names(root)
 
     if pairs[0][1].suffix.lower() != ".json":
@@ -378,7 +489,7 @@ def scan_label_info(pairs, merge_json_labels=False, mask_mode="auto", class_name
         cls_names = ["background"] + order
         print("[data] 类别名: 未找到 classes.txt，直接使用 labelme 的标签名 %s" % order)
     print("[data] labelme 标签名 -> 类别索引: %s（0=背景）" % label2idx)
-    return {"kind": "json", "mask_mode": None, "label2idx": label2idx,
+    return {"kind": "json", "mask_mode": None, "label2idx": label2idx, "merged": bool(merge_json_labels),
             "num_classes": num_classes, "class_names": cls_names, "class_values": None}
 
 
@@ -490,6 +601,19 @@ class SegDataset(Dataset):
         """返回已缩放到目标尺寸的 (uint8 图像, 类别索引 mask)，用于可视化。"""
         return self._cache[i] if self._cache[i] is not None else self._load(i)
 
+    def get_full(self, i):
+        """返回**原分辨率**的 (uint8 图像, 类别索引 mask)：给训练结束后的可视化用，
+        与 predict.py 一样先把预测放大回原图尺寸再叠加，保证与原图完全对齐。"""
+        ip, lp = self.pairs[i]
+        img = load_image(ip, self.in_channels)
+        if self.info["kind"] == "json":
+            mask = rasterize_labelme(lp, self.info["label2idx"], img.shape[:2])
+        else:
+            mask = mask_to_index(read_mask(lp), self.info)
+        if mask.shape[:2] != img.shape[:2]:   # 极端情况：mask 与图不同尺寸
+            mask = resize_image(mask, img.shape[:2], is_mask=True)
+        return img, mask
+
     def __len__(self):
         return len(self.pairs)
 
@@ -549,7 +673,8 @@ def build_datasets(cfg):
     info = scan_label_info(pairs,
                            merge_json_labels=cfg["json_merge_labels"],
                            mask_mode=cfg.get("mask_mode", "auto"),
-                           class_names=cfg.get("class_names") or None)
+                           class_names=cfg.get("class_names") or None,
+                           root=root, use_cache=bool(cfg.get("label_cache", True)))
     if len(pairs) < 2:
         raise RuntimeError("至少需要 2 张图像才能划分训练/验证集")
 
