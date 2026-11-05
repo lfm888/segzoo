@@ -27,6 +27,7 @@ DEFAULTS = {
     "in_channels": TRAIN_DEFAULTS["in_channels"],
     "batch_size": TRAIN_DEFAULTS["batch_size"],
     "runs_dir": TRAIN_DEFAULTS["runs_dir"],
+    "device": TRAIN_DEFAULTS["device"],          # auto / cuda / cpu（无 GPU 时用 cpu 做快速对比）
 }
 # ===========================================================================
 
@@ -50,7 +51,7 @@ def pareto_flags(rows):
 def main():
     sw = parse_args(DEFAULTS, "批量对比 架构 x 编码器")
     base = dict(TRAIN_DEFAULTS)
-    for k in ("dataset", "data_root", "img_size", "in_channels", "batch_size", "runs_dir", "epochs"):
+    for k in ("dataset", "data_root", "img_size", "in_channels", "batch_size", "runs_dir", "epochs", "device"):
         base[k] = sw[k]
     hw = to_hw(base["img_size"])
     out_root = abspath(base["runs_dir"]) / base["dataset"]
