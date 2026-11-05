@@ -25,13 +25,13 @@ from utils import (abspath, imwrite_unicode, normalize, parse_args, render_predi
 DEFAULTS = {
     # ---- 数据 ----
     "data_root": "data",              # 数据根目录（相对框架目录，也可写绝对路径如 E:/xxx/data）
-    "dataset": "inner_circle_dataset",                # 数据集文件夹名：<data_root>/<dataset>/{train_dataset,labels}
+    "dataset": "aidk_partial",                # 数据集文件夹名：<data_root>/<dataset>/{train_dataset,labels}
     "images_subdir": "train_dataset",
     "labels_subdir": "labels",
     "json_merge_labels": False,       # labelme 里出现多个 label 名时，True=全部并成同一前景类
     "mask_mode": "auto",              # mask 标签编码：auto / index(单通道索引图) / channels(每通道=1类，AIDK 风格)
     "class_names": [],                # 可选类名（含背景也行）；空=自动读 <dataset>/classes.txt，没有则用默认名
-    "img_size": [64, 64],           # [H, W]，需为 32 的倍数。AIDK 常用 288,512；labelme 数据用 224,224 或 64,64
+    "img_size": [224, 224],           # [H, W]，需为 32 的倍数。AIDK 常用 288,512；labelme 数据用 224,224 或 64,64
     "in_channels": 1,                 # 1=灰度，3=RGB
     "num_classes": 0,                 # 含背景；0=自动（labelme 单类别 -> 2，AIDK 三通道 mask -> 4）
     "mean": [127.5],                  # 归一化 (x-mean)/std，0~255 单位；RKNN 转换会读同一组值
@@ -48,7 +48,7 @@ DEFAULTS = {
     # ---- 模型 ----
     "arch": "unet",                   # unet / fpn / linknet / pan / unetplusplus / manet / deeplabv3plus ...
     "encoder": "resnet18",            # resnet18 / resnet34 / mobilenet_v2 / tu-xxx(timm 模型) ...
-    "encoder_weights": "imagenet",    # imagenet 或 none（下载失败会自动退回 none 并提示）
+    "encoder_weights": "none",    # imagenet 或 none（下载失败会自动退回 none 并提示）
     # ---- 训练 ----
     "epochs": 3,
     "batch_size": 8,

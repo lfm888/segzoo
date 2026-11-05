@@ -31,7 +31,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from utils import IMG_EXTS, abspath, imread_unicode, load_image, normalize, resize_image, to_hw
+from utils import (IMG_EXTS, ROOT, abspath, imread_unicode, load_image, normalize, parse_args,
+                   resize_image, to_hw)
 
 MASK_SUFFIXES = ["", "_mask", "_label", "_labels", "_gt", "_seg", "-mask", "-label"]
 CLASS_FILES = ("classes.txt", "classes.json")  # 可选的类别名文件
@@ -799,3 +800,130 @@ def build_datasets(cfg):
                 train_files=[pairs[i][0].name for i in train_idx],
                 split=split_src, n_train=len(train_idx), n_val=len(val_idx), n_test=len(test_idx))
     return train_ds, val_ds, info
+
+
+# --------------------------------------------------------------------------
+# 直接运行：只生成 label_info.txt + split.txt（不训练、不解码图像）
+#   python dataset.py                      # 交互输入数据集路径
+#   python dataset.py --dataset data/OCT5K # 命令行直接给路径
+# --------------------------------------------------------------------------
+PREP_DEFAULTS = {
+    "dataset": r"E:\lfm\segzoo\data\CorneaNet",              # 数据集路径；空=运行时交互输入（可以是 data/xxx、绝对路径、或 train_dataset 目录）
+    "data_root": "data",        # 只输入数据集名字（如 OCT5K）时到这里找
+    "images_subdir": "train_dataset",
+    "labels_subdir": "labels",
+    "json_merge_labels": True,  # labelme 多个 label 名是否全部并成同一前景类
+    "mask_mode": "auto",        # auto / index / channels
+    "class_names": [],          # 空=自动（classes.txt -> labelme json 标签名 -> class_N）
+    "val_ratio": 0.2,           # 新划分时的验证集占比
+    "test_ratio": 0.6,          # 新划分时的测试集占比（train.py 不碰 test，留给 predict.py 评估）
+    "seed": 42,
+    "split_csv": "auto",        # 首次划分时若存在 <dataset>/split/test_train_data.csv 就沿用
+    "split_file": "split.txt",  # 划分文件名；空字符串=不生成
+    "resplit": False,           # True=忽略现有 split.txt 重新划分
+    "rescan": False,            # True=忽略现有 label_info.txt 重新扫描标签
+}
+
+
+def resolve_dataset_dir(raw, cfg):
+    """把用户输入的路径变数据集根目录（含 train_dataset/ 或 labels/ 的那一级）；找不到返回 None。"""
+    raw = str(raw).strip().strip('"').strip("'")
+    tried = []
+    for cand in (Path(raw).expanduser(), ROOT / raw, abspath(cfg["data_root"]) / raw):
+        cand = Path(cand)
+        tried.append(cand)
+        if not cand.is_dir():
+            continue
+        if cand.name in (str(cfg["images_subdir"]), str(cfg["labels_subdir"])):  # 直接给了子目录
+            cand = cand.parent
+        if (cand / cfg["images_subdir"]).is_dir() or (cand / cfg["labels_subdir"]).is_dir():
+            return cand.resolve()
+    print("[x] 没找到数据集目录，试过: %s" % ", ".join(str(t) for t in tried))
+    print("    需要包含 %s/（图像）与 %s/（标签）的目录" % (cfg["images_subdir"], cfg["labels_subdir"]))
+    return None
+
+
+def prepare_dataset(cfg):
+    """生成 label_info.txt 与 split.txt（已存在且有效时直接复用）。返回 summary dict。"""
+    root = resolve_dataset_dir(cfg["dataset"], cfg)
+    if root is None:
+        return None
+    img_dir, lab_dir = root / cfg["images_subdir"], root / cfg["labels_subdir"]
+    print("=" * 78)
+    print("数据集: %s   (%s)" % (root.name, root))
+    print("  图像目录: %s%s   标签目录: %s%s" % (
+        cfg["images_subdir"], "" if img_dir.is_dir() else "（不存在！）",
+        cfg["labels_subdir"], "" if lab_dir.is_dir() else "（不存在，会尝试用图像目录里的 .json）"))
+    print("-" * 78)
+
+    # 1) 配对
+    pairs = collect_pairs(img_dir, lab_dir)
+    print("[1/3] 图像-标签配对: %d 对" % len(pairs))
+
+    # 2) label_info.txt（类别数 / 类名 / 像素值或通道）
+    info = scan_label_info(pairs, merge_json_labels=cfg["json_merge_labels"],
+                           mask_mode=cfg["mask_mode"], class_names=cfg["class_names"] or None,
+                           root=root, use_cache=not cfg["rescan"])
+    print("[2/3] %s: %s" % (INFO_FILE, "复用已有（未重扫）" if info.get("from_cache") else "已扫描并写入"))
+
+    # 3) split.txt（固定 train/val/test）
+    assign, split_src = load_splits(pairs, root, cfg)
+    train_idx, val_idx, test_idx = split_indices(pairs, assign)
+    print("[3/3] %s: train %d / val %d / test %d   <- %s" % (
+        cfg["split_file"] or "(未生成)", len(train_idx), len(val_idx), len(test_idx), split_src))
+
+    names = list(info["class_names"])
+    generic = [n for n in names[1:] if str(n).startswith("class_")]
+    print("-" * 78)
+    print("类别 %d（含背景）: %s" % (info["num_classes"],
+                                  "  ".join("%d=%s" % (i, n) for i, n in enumerate(names))))
+    if generic:
+        print("提示: 类名还是默认的 %s，可在 %s 放 classes.txt（每行一个类名，可含 background）后重跑" % (
+            generic[:3], root / "classes.txt"))
+    if not val_idx:
+        print("[warn] 验证集为空，无法训练：检查 %s" % (root / cfg["split_file"]))
+    if not test_idx:
+        print("[warn] 测试集为空：predict.py 的 --split test 将无可评估数据")
+    print("=" * 78)
+    def _rel(base, path):      # 能用相对路径就用，命令行更短
+        try:
+            return str(path.relative_to(base)).replace("\\", "/")
+        except ValueError:
+            return str(path)
+    train_ref = _rel(abspath(cfg["data_root"]).resolve(), root)   # train.py 的 --dataset 相对 data_root
+    pred_ref = _rel(ROOT.resolve(), root)                         # predict.py 的 --input_dir 相对项目目录
+    print("完成。可以开始训练（只用 train+val）：")
+    print("  python train.py --dataset %s" % train_ref)
+    print("模型定型后评估泛化能力（test 段）：")
+    print("  python predict.py --input_dir %s --split test" % pred_ref)
+    return {"root": root, "pairs": pairs, "info": info, "assign": assign,
+            "n": (len(train_idx), len(val_idx), len(test_idx))}
+
+
+def main():
+    cfg = parse_args(PREP_DEFAULTS, "只生成数据集的两份 txt：label_info.txt（标签扫描）+ split.txt（train/val/test 划分）")
+    if not cfg["dataset"]:
+        print("=" * 78)
+        print("数据集准备工具：生成 label_info.txt + split.txt，不训练、不读图")
+        print("  · label_info.txt  标签扫描结果（类别数 / 类名 / 像素值或通道），训练时直接复用")
+        print("  · split.txt       固定的 train/val/test 划分（train.py 只用 train+val，test 留给 predict.py）")
+        print("=" * 78)
+        while True:
+            try:
+                raw = input("请输入数据集目录（可以是 data/xxx 或绝对路径，直接回车用默认示例，q 退出）: ")
+            except (EOFError, KeyboardInterrupt):
+                raise SystemExit("\n已取消")
+            raw = raw.strip()
+            if raw.lower() in ("q", "quit", "exit"):
+                raise SystemExit("已取消")
+            if not raw:
+                print("  例如: data/inner_circle_dataset")
+                continue
+            cfg["dataset"] = raw
+            if resolve_dataset_dir(raw, cfg) is not None:
+                break
+    prepare_dataset(cfg)
+
+
+if __name__ == "__main__":
+    main()

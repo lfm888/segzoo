@@ -80,6 +80,7 @@ fingerprint = {"files": 768, "bytes": 10313855, "mtime": 1793152981816731400, "p
 | 脚本 | 作用 |
 |---|---|
 | `check_env.py` | 环境自检（依赖、GPU、前向、ONNX 导出） |
+| `dataset.py` | **只生成数据集的 `label_info.txt` + `split.txt`**（不训练）：`python dataset.py` 后输入数据集路径 |
 | `inspect_data.py` | 探测 `data/` 下所有数据集：标签形式（json / png 单通道索引 / png 多通道 one-hot）、类别、数量、尺寸、磁盘占用 |
 | `make_demo_data.py` | 生成合成数据（索引 mask / 多通道 mask / labelme json），冒烟测试流程 |
 | `train.py` | 训练单个模型，保存 best.pth / 日志 / 可视化 / results.json |
@@ -240,3 +241,36 @@ python predict.py --dash 12 --gap 8                # 手动指定虚线节奏（
 所以「色块与虚线重合」= 预测正确；虚线露出色块外 = 漏检；只有色块没有虚线 = 误检。
 渲染与 `predict.py` 共用 `utils.render_prediction(..., edge_mask=gt)`；
 色块透明度用 `--vis_alpha`（默认 0.45，同 `predict.py --alpha`）。
+
+## 只准备数据集（`python dataset.py`，不训练）
+手里只有 `<数据集>/train_dataset/` 和 `<数据集>/labels/` 时，先跑这个把两份 txt 生成好，再训练：
+```
+$ python dataset.py
+==================================================================
+数据集准备工具：生成 label_info.txt + split.txt，不训练、不读图
+==================================================================
+请输入数据集目录（可以是 data/xxx 或绝对路径，直接回车用默认示例，q 退出）: data/OCT5K
+
+==============================================================================
+数据集: OCT5K   (E:\lfm\segzoo\data\OCT5K)
+  图像目录: train_dataset   标签目录: labels
+------------------------------------------------------------------------------
+[1/3] 图像-标签配对: 3207 对
+[data] 标签扫描结果已缓存: data\OCT5K\label_info.txt（下次训练直接复用）
+[2/3] label_info.txt: 已扫描并写入
+[data] 已生成固定划分: ...\data\OCT5K\split.txt（按 seed=42 随机划分（val_ratio=0.2, test_ratio=0.2））
+[3/3] split.txt: train 1925 / val 641 / test 641   <- split.txt（新建: 按 seed=42 随机划分）
+------------------------------------------------------------------------------
+类别 6（含背景）: 0=background  1=class_1 ...  5=class_5
+==============================================================================
+```
+也可以直接给参数，适合写批处理：
+```
+python dataset.py --dataset data/OCT5K
+python dataset.py --dataset D:/其他数据/xxx --val_ratio 0.15 --test_ratio 0.15
+python dataset.py --dataset data/OCT5K --rescan true --resplit true   # 强制重扫标签 + 重新划分
+```
+要点：
+- 输入的路径可以是 `data/xxx`、绝对路径，或者直接指到 `<数据集>/train_dataset`
+- 只解析标签与文件名，**不解码训练、不占显存**；标签多时也能几秒完成（已缓存时毫秒级）
+- 类名仍是默认 `class_N` 时，脚本会提示去放 `classes.txt`；改完重跑即可（不用删 `label_info.txt`）

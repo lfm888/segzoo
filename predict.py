@@ -33,7 +33,7 @@ DEFAULTS = {
     "runs_dir": "runs",
     "backend": "torch",      # torch / onnx（onnx 用同目录 model.onnx，用来验证导出后的模型）
     # ---- 输入 ----
-    "input_dir": "",         # 空=训练时的数据集；也可以是【同格式数据集目录】或【纯图像目录】
+    "input_dir": r"E:\lfm\segzoo\data\CorneaNet",         # 空=训练时的数据集；也可以是【同格式数据集目录】或【纯图像目录】
     "images_subdir": "",     # 指定 input_dir 下的图像子目录（空=自动找 train_dataset/images，否则用 input_dir 本身）
     "labels_subdir": "labels",   # 数据集目录里的标签子目录名
     "split": "test",         # test / val / train / all；该目录没有 split.txt 时自动按 all
