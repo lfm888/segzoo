@@ -23,7 +23,7 @@ from utils import abspath, imwrite_unicode, normalize, overlay, parse_args, to_b
 DEFAULTS = {
     # ---- 数据 ----
     "data_root": "data",              # 数据根目录（相对框架目录，也可写绝对路径如 E:/xxx/data）
-    "dataset": "aidk_fullframe",                # 数据集文件夹名：<data_root>/<dataset>/{train_dataset,labels}
+    "dataset": "OCT5K",                # 数据集文件夹名：<data_root>/<dataset>/{train_dataset,labels}
     "images_subdir": "train_dataset",
     "labels_subdir": "labels",
     "json_merge_labels": False,       # labelme 里出现多个 label 名时，True=全部并成同一前景类

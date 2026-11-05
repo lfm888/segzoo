@@ -38,6 +38,7 @@ csv 规则（与 `python_model_train` 一致）：`category=train` 参与训练�
 | 脚本 | 作用 |
 |---|---|
 | `check_env.py` | 环境自检（依赖、GPU、前向、ONNX 导出） |
+| `inspect_data.py` | 探测 `data/` 下所有数据集：标签形式（json / png 单通道索引 / png 多通道 one-hot）、类别、数量、尺寸、磁盘占用 |
 | `make_demo_data.py` | 生成合成数据（索引 mask / 多通道 mask / labelme json），冒烟测试流程 |
 | `train.py` | 训练单个模型，保存 best.pth / 日志 / 可视化 / results.json |
 | `sweep.py` | 批量对比 架构×编码器，输出排行榜与帕累托 |
@@ -47,6 +48,7 @@ csv 规则（与 `python_model_train` 一致）：`category=train` 参与训练�
 
 ## 典型流程
 ```
+python inspect_data.py                                               # 先看一遍所有数据集的情况
 python make_demo_data.py
 python train.py --dataset _demo_mask --img_size 128,128 --epochs 3        # 冒烟：索引 mask
 python train.py --dataset _demo_mask_ch --img_size 128,128 --epochs 3     # 冒烟：多通道 mask
@@ -56,6 +58,27 @@ python sweep.py                       # 批量对比
 python export_onnx.py && python predict.py --backend onnx
 # Linux 上：python convert_rknn.py
 ```
+
+## 数据集探测（`inspect_data.py`）
+先跑一遍，确认每个数据集的标签形式与类别数，训练日志里的 `类别数 / 标签编码` 应与它一致。
+```
+---- [4/6  aidk_fullframe] ----------------------------------------------------
+  路径            E:\lfm\segzoo\data\aidk_fullframe
+  图像            768 张  .bmp×768
+  图像尺寸        1723x1000（抽样 8 张）   3 通道
+  标签文件        768 个  .png   9.8 MB
+  标签形式        png 多通道 one-hot（每通道=1 类，通道内 >0 为前景）
+  标签细节        dtype=uint8  通道数=3
+  类别数          4（含背景）
+  类别名          0=background  1=Cornea  2=Iris  3=Lesion
+  像素占比        background 96.10%  Cornea 2.61%  Iris 0.98%  Lesion 0.31%
+...
+  数据集                配对/图像   标签形式                    类别  输入尺寸      磁盘
+  aidk_fullframe        768/768     png 多通道 one-hot(3ch)     4     1723x1000     3.7 GB
+  inner_circle_dataset  524/524     png 单通道二值              2     200x200       9.1 MB
+  OCT5K                 3207/3207   png 单通道索引(6 种值)      6     512x512       375.6 MB
+```
+`--max_scan` 控制每个数据集抽样多少张 mask 做像素/通道统计（`0`=全部），`--data_root` 可换根目录。
 
 ## 训练输出长什么样
 ```
