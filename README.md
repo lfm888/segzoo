@@ -175,18 +175,29 @@ Epoch   3/30    lr 9.02e-04  |  训练 5s + 验证 1s = 6s  |  已用 17s  剩�
 进度条可用 `--progress_bar false` 关闭（非终端环境自动改成每 20% 打一行）。
 
 ## 预测 / 最终评估（`predict.py`）
-默认只在 **test 段**（`split.txt` 里的 test）上跑，作为模型定型后的泛化评估；有标签时直接算指标并打印表格。
+`--input_dir` 支持三种情况，代码会自动识别：
+
+| 传入的目录 | 行为 |
+|---|---|
+| 留空 | 用 ckpt 记录的训练数据集，默认只跑它的 `split.txt` 的 **test** 段 |
+| 同格式数据集目录（含 `train_dataset/` + `labels/` [+ `split.txt`]） | 有 split.txt 就按 `--split` 取子集（默认 test）；有 labels 就算指标、画 GT 虚线 |
+| 纯图像目录（只有图） | 对该目录**全部图像**推理；没有 GT → 不画虚线、不算指标 |
+
+也可以直接指向 `<数据集>/train_dataset`——会自动到上一级找 `labels/` 和 `split.txt`。
 ```
-python predict.py                            # 最新 best.pth，在 test 段评估 + 出图
-python predict.py --split val                # 看 val 段（调试用）
-python predict.py --split all --metrics false # 没标签的新图：全部推理，只要图
-python predict.py --max_images 8             # 只跑 8 张（默认 0 = 全部）
-python predict.py --backend onnx             # 用导出的 model.onnx 评估，顺便验证前后处理一致性
-python predict.py --save_vis false           # 只要指标，不存图（快很多）
+python predict.py                                        # 训练数据集的 test 段 + 指标
+python predict.py --input_dir data/new_dataset           # 只有图的新数据：全部推理，只要图
+python predict.py --input_dir data/OCT5K --split test    # 指定数据集，评估它的 test 段
+python predict.py --input_dir D:/其他项目/images --edge pred   # 没有 GT 时用预测自身轮廓画虚线
+python predict.py --split val                            # 看 val 段（调试用）
+python predict.py --max_images 8                         # 只跑 8 张（默认 0 = 全部）
+python predict.py --backend onnx                         # 用导出的 model.onnx 评估，验证前后处理一致性
+python predict.py --save_vis false                       # 只要指标，不存图（快很多）
 ```
 输出：
-- 每张图一张 `<stem>_result.png`（原图 + 半透明分割色块 + 同色虚线边界 + 图例）
-- `<out_dir>/metrics_test.json`（含每类 dice/iou/P/R/F1、前景均值、像素准确率、ckpt 路径等）
+- 每张图一张 `<stem>_result.png`（原图 + 半透明分割色块 [+ 同色虚线边界] + 图例）
+- 有 GT 时：`<out_dir>/metrics_<split>.json`（每类 dice/iou/P/R/F1、前景均值、像素准确率、ckpt、输入目录）
+- 输出目录默认 `<ckpt 目录>/predict`；指定了 `--input_dir` 时是 `predict_<目录名>`，避免和训练集结果混在一起
 ```
 ==============================================================================
 最终评估（test 段）| unet_resnet18_128x128 | unet + resnet18 @ 128x128 | 统计 52 张
@@ -202,10 +213,12 @@ python predict.py --save_vis false           # 只要指标，不存图（快很
 
 ## 预测结果可视化细节
 - 底图 = 原图（原分辨率）
-- 每个类别 = **半透明色块** + **同色虚线边界**（边界画在色块之上，线宽/虚线节奏按图像尺寸自动取）
-- 左上角图例：当前图出现的类别（颜色与虚线/色块一致，类名取自训练时的 `meta.class_names`）
+- **半透明色块** = 预测结果
+- **同色虚线** = `--edge` 指定的轮廓：`auto`（默认，有 GT 用 GT，没有就不画）/ `gt` / `pred`（画预测自身轮廓）/ `none`
+- 左上角图例：当前图出现的类别（类名取自训练时的 `meta.class_names`）
 
 ```
+python predict.py --edge pred                      # 没有 GT 的数据集也想看轮廓
 python predict.py --alpha 0.3 --thickness 2        # 色块更淡 / 虚线更粗（默认 = 短边/600，即 1~2px）
 python predict.py --thickness 1                    # 强制 1px 虚线（不抗锯齿，虚线节奏更清楚）
 python predict.py --legend false                   # 不画图例

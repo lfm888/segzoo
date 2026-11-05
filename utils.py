@@ -258,19 +258,20 @@ def _draw_legend(img, present, colors, names, thickness, line_type=cv2.LINE_AA):
 
 
 def render_prediction(img, mask, alpha=0.45, class_names=None, dash=0, gap=0, thickness=None, legend=True,
-                      edge_mask=None):
+                      edge_mask=None, draw_edges=True):
     """一张图同时表示原图 / 轮廓 / 分割结果：
       - 每个前景类在原图上用**半透明色填充**（来自 mask = 预测结果）
       - 每类的**边界用同色虚线**画在填充之上（默认也取自 mask；传 edge_mask 就用它，
         典型用法：色块=预测、虚线=真值，一张图直接看预测与 GT 的偏差）
+      - draw_edges=False 则不画任何虚线（没有 GT 的场景）
     返回 BGR uint8。img 可以是 load_image 的结果（灰度/RGB）或 resize 后的图，mask 与之同尺寸。
     """
     out = to_bgr(img).astype(np.float32)
-    edge = mask if edge_mask is None else edge_mask
-    n_cls = int(max(mask.max(), edge.max())) + 1
+    edge = edge_mask if (draw_edges and edge_mask is not None) else (mask if draw_edges else mask)
+    n_cls = int(max(int(mask.max()), int(edge.max()) if draw_edges else 0)) + 1
     colors = palette(n_cls)
     fill_cls = [c for c in range(1, n_cls) if (mask == c).any()]
-    edge_cls = [c for c in range(1, n_cls) if (edge == c).any()]
+    edge_cls = [c for c in range(1, n_cls) if draw_edges and (edge == c).any()]
     present = sorted(set(fill_cls) | set(edge_cls))
     for c in fill_cls:                                    # 半透明填充（预测）
         m = mask == c
