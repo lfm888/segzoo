@@ -1,0 +1,12 @@
+# segzoo 标签扫描缓存：自动生成，删除后下次训练会重新扫描（手改 classes.txt 优先）
+version = 1
+generated = 2026-11-05 15:57:26
+json_merge_labels = false
+scan_mask_mode = "auto"
+binary = false
+class_names = ["background", "class_1", "class_2"]
+class_values = [0, 128, 255]
+kind = "mask"
+mask_mode = "index"
+num_classes = 3
+fingerprint = {"files": 24, "bytes": 14936, "mtime": 1793865443686350000, "pairs": 24}

@@ -2,7 +2,7 @@
 
 基于 [segmentation_models.pytorch](https://github.com/qubvel/segmentation_models.pytorch) 的医学图像分割快速验证框架。
 
-- **换数据集、换模型都只改一个参数**：同一份数据、同一份划分，快速比较 `架构 × 编码器`
+- **换数据集、换模型都只改一个参数**：同一份数据、同一份划分，快速比较 `架构 × 编码器`，也可直接用 LiteSeg / TransUNet 等 SOTA 模型
 - **固定划分**：train / val / test 一次生成。训练只看 val，test 留给最终评估
 - **自动识别标签**：labelme `.json`、单通道索引 png、多通道 one-hot png
 - **可视化**：预测图一张看完原图、分割结果和真值轮廓；训练自动生成曲线图
@@ -46,14 +46,36 @@ python dataset.py --dataset data/<数据集名>   # 生成 split.txt 与 label_i
 python train.py --dataset <数据集名> --arch unet --encoder resnet18 --img_size 224,224 --epochs 50
 ```
 
-### 4. 对比与评估
+### 4. 使用 SOTA 模型（LiteSeg / TransUNet）
+
+`sota/` 文件夹里的模型不走 smp，设置 `sota_model` 即可，其余流程不变：
+
+```bash
+# LiteSeg：有可选骨干
+python train.py --dataset <数据集名> --sota_model liteseg --sota_backbone resnet18
+
+# TransUNet：结构固定，骨干留空；输入必须正方形（16 的倍数）
+python train.py --dataset <数据集名> --sota_model transunet --sota_backbone "" --img_size 224,224
+```
+
+| `sota_model` | `sota_backbone` | 输入要求 |
+|---|---|---|
+| `liteseg` | 必填（`resnet18/34/50/101/152`、`mobilenet_v2`） | 32 的倍数 |
+| `transunet` | **必须留空** | 正方形、16 的倍数 |
+
+TransUNet 需要自行下载 R50+ViT-B/16 权重（约 380MB）放到 `sota/transunet/checkpoints/`，
+没有也能从零训练。
+
+详见 [docs/sota.md](docs/sota.md)。
+
+### 5. 对比与评估
 
 ```bash
 python sweep.py --dataset <数据集名> --epochs 30     # 批量对比 架构 × 编码器，输出排行榜
 python predict.py                                    # 在 test 段做最终评估，输出指标与可视化
 ```
 
-### 5. 导出部署
+### 6. 导出部署
 
 ```bash
 python export_onnx.py                   # best.pth → model.onnx
@@ -70,7 +92,8 @@ python convert_rknn.py                  # 仅 Linux / WSL2，需要 rknn-toolkit
 | `data/<数据集名>/split.txt` | 自动生成的 train/val/test 划分，可手工修改 |
 | `data/<数据集名>/label_info.txt` | 自动生成的标签扫描缓存 |
 | `data/<数据集名>/classes.txt` | 可选，类别名，每行一个 |
-| `runs/<数据集名>/<arch>_<encoder>_<H>x<W>/` | 训练输出：权重、日志、曲线、可视化 |
+| `runs/<数据集名>/<arch>_<encoder>_<H>x<W>/` | 训练输出：权重、日志、曲线、可视化（SOTA 模型为 `<sota_model>_<backbone>_<H>x<W>`，骨干为空时如 `transunet_224x224`） |
+| `sota/` | 非 smp 的 SOTA 模型（LiteSeg、TransUNet），每个模型一个子目录 |
 
 ## 脚本一览
 
@@ -101,6 +124,7 @@ python train.py --acc_exclude_bg false            # 布尔参数传 true / false
 | [docs/split.md](docs/split.md) | train / val / test 划分规则与自动重划 |
 | [docs/outputs.md](docs/outputs.md) | 训练输出、日志字段、指标与曲线图说明 |
 | [docs/predict.md](docs/predict.md) | 预测输入模式、可视化约定、最终评估 |
+| [docs/sota.md](docs/sota.md) | SOTA 模型（LiteSeg / TransUNet）的用法、迁移说明、如何新增模型 |
 
 ## 常见问题
 

@@ -26,7 +26,8 @@ from torch.utils.data import DataLoader
 import segmentation_models_pytorch as smp
 
 from dataset import INFO_FILE, build_datasets
-from models import benchmark_ms, build_model, count_gflops
+from models import benchmark_ms, build_model, count_gflops, model_desc, run_name, sota_spec
+from sota import sota_info
 from utils import (abspath, imwrite_unicode, normalize, parse_args, plot_training_curves,
                    render_prediction, resize_image, seg_metrics, to_hw)
 
@@ -34,14 +35,14 @@ from utils import (abspath, imwrite_unicode, normalize, parse_args, plot_trainin
 DEFAULTS = {
     # ---- 数据 ----
     "data_root": "data",              # 数据根目录（相对框架目录，也可写绝对路径如 E:/xxx/data）
-    "dataset": "OCT5K",                # 数据集文件夹名：<data_root>/<dataset>/{train_dataset,labels}
+    "dataset": "lens_dataset",                # 数据集文件夹名：<data_root>/<dataset>/{train_dataset,labels}
     "images_subdir": "train_dataset",
     "labels_subdir": "labels",
     "json_merge_labels": False,       # labelme 里出现多个 label 名时，True=全部并成同一前景类
     "mask_mode": "auto",              # mask 标签编码：auto / index(单通道索引图) / channels(每通道=1类，AIDK 风格)
     "class_names": [],                # 可选类名（含背景也行）；空=自动读 <dataset>/classes.txt，没有则用默认名
     "img_size": [224, 224],           # [H, W]，需为 32 的倍数。AIDK 常用 288,512；labelme 数据用 224,224 或 64,64
-    "in_channels": 1,                 # 1=灰度，3=RGB
+    "in_channels": 3,                 # 1=灰度，3=RGB
     "num_classes": 0,                 # 含背景；0=自动（labelme 单类别 -> 2，AIDK 三通道 mask -> 4）
     "norm": "auto",                   # 输入归一化方式：
                                       #   auto     = 用预训练权重(encoder_weights!=none)时用 ImageNet 归一化，否则用下面的 mean/std
@@ -63,9 +64,14 @@ DEFAULTS = {
     # ---- 模型 ----
     "arch": "unet",                   # unet / fpn / linknet / pan / unetplusplus / manet / deeplabv3plus ...
     "encoder": "resnet18",            # resnet18 / resnet34 / mobilenet_v2 / tu-xxx(timm 模型) ...
+    # ---- SOTA 模型（sota/ 文件夹，如 LiteSeg）----
+    # sota_model 非空 = 不使用上面的 arch / encoder，改用 sota/ 下的模型；可选名字见 sota/__init__.py
+    "sota_model": "transunet",                 # 例如 "liteseg"；空字符串 = 使用 smp 的 arch + encoder
+    "sota_backbone": "resnet18",      # sota 模型的骨干（liteseg: resnet18/34/50/101/152 或 mobilenet_v2）
+    "sota_act": "relu",               # sota 模型的激活函数（relu / leakyrelu / silu / hardswish ...）
     "encoder_weights": "imagenet",    # imagenet 或 none（下载失败会自动退回 none 并提示）
     # ---- 训练 ----
-    "epochs": 100,
+    "epochs": 10,
     "batch_size": 8,
     "lr": 1e-3,                       # 解码器/分割头学习率（编码器随机初始化时，编码器也用这个）
     "encoder_lr_mult": 0.1,           # 预训练编码器学习率 = lr * 该值（0.1 -> 1e-4）；1.0=不区分。
@@ -332,8 +338,8 @@ def print_summary(cfg, info, train_ds, val_ds, train_loader, model, C, hw, devic
     n_steps = len(train_loader)
 
     print("=" * W)
-    print("segzoo 训练  |  %s + %s @ %dx%d  |  %s" % (
-        cfg["arch"], cfg["encoder"], hw[0], hw[1],
+    print("segzoo 训练  |  %s @ %dx%d  |  %s" % (
+        model_desc(cfg["arch"], cfg["encoder"]), hw[0], hw[1],
         torch.cuda.get_device_name(0) if device.type == "cuda" else "CPU"))
     print("=" * W)
 
@@ -358,7 +364,8 @@ def print_summary(cfg, info, train_ds, val_ds, train_loader, model, C, hw, devic
 
     _section("2/4 模型")
     lines = []
-    _kv(lines, "结构", "%s + %s" % (cfg["arch"], cfg["encoder"]))
+    note = ("   (sota/ 模型：%s)" % sota_info(cfg["sota_model"])["desc"]) if cfg.get("sota_model") else ""
+    _kv(lines, "结构", model_desc(cfg["arch"], cfg["encoder"]) + note)
     _kv(lines, "预训练", "%s" % cfg["encoder_weights"])
     _kv(lines, "参数量", "%.3f M / 可训练 %.3f M   (FP32 约 %.1f MB)" % (
         total / 1e6, trainable / 1e6, total * 4 / 1024 ** 2))
@@ -414,6 +421,10 @@ def print_epoch(ep, n_ep, tm, vm, names, lr, t_train, t_val, elapsed, eta, is_be
 def run(cfg):
     """训练一个模型并返回结果 dict（sweep.py 也会调用它）。"""
     cfg = dict(cfg)                       # 下面会写入实际使用的 mean/std，不改调用方的字典
+    # sota 模型：下游的命名 / 打印 / meta / 结果文件统一读 arch、encoder 两个字段，这里把它们换成 sota 的名字
+    sota = sota_spec(cfg, to_hw(cfg["img_size"]))   # 同时检查骨干与输入尺寸（如 TransUNet 要正方形）
+    if sota:
+        cfg["arch"], cfg["encoder"] = sota["name"], sota["backbone"]
     # GradScaler 在最开始几步因梯度 inf 跳过 optimizer.step 时，PyTorch 会对逐步 scheduler 报一次无害警告
     warnings.filterwarnings("ignore", message=".*lr_scheduler.step\\(\\).*before.*optimizer.step\\(\\).*")
     t0 = time.time()
@@ -432,17 +443,18 @@ def run(cfg):
 
     train_ds, val_ds, info = build_datasets(cfg)
     C = cfg["num_classes"] or info["num_classes"]
-    name = "%s_%s_%dx%d" % (cfg["arch"], cfg["encoder"], hw[0], hw[1])
+    name = run_name(cfg["arch"], cfg["encoder"], hw[0], hw[1])
     run_dir = abspath(cfg["runs_dir"]) / cfg["dataset"] / name
     run_dir.mkdir(parents=True, exist_ok=True)
-    print("[run] 构建模型 %s + %s (in_channels=%d, classes=%d, encoder_weights=%s) ..." % (
-        cfg["arch"], cfg["encoder"], int(cfg["in_channels"]), C, cfg["encoder_weights"]))
+    print("[run] 构建模型 %s (in_channels=%d, classes=%d, encoder_weights=%s) ..." % (
+        model_desc(cfg["arch"], cfg["encoder"]), int(cfg["in_channels"]), C, cfg["encoder_weights"]))
 
     ew = None if str(cfg["encoder_weights"]).lower() in ("none", "") else cfg["encoder_weights"]
-    model = build_model(cfg["arch"], cfg["encoder"], cfg["in_channels"], C, ew).to(device)
+    model = build_model(cfg["arch"], cfg["encoder"], cfg["in_channels"], C, ew, sota=sota,
+                        img_size=hw[0]).to(device)
 
     meta = {  # 只放基础类型，保证 torch.load 在新版本下也安全
-        "arch": cfg["arch"], "encoder": cfg["encoder"], "in_channels": int(cfg["in_channels"]),
+        "arch": cfg["arch"], "encoder": cfg["encoder"], "sota": sota, "in_channels": int(cfg["in_channels"]),
         "num_classes": int(C), "img_size": [hw[0], hw[1]],
         "mean": [float(v) for v in cfg["mean"]], "std": [float(v) for v in cfg["std"]], "norm": norm_txt,
         "dataset": cfg["dataset"], "data_root": str(cfg["data_root"]), "images_subdir": cfg["images_subdir"],
@@ -590,7 +602,7 @@ def run(cfg):
             run_dir / "log.csv", run_dir / "curves.png", acc_key=acc_key, acc_label=acc_label,
             class_names=names, best_epoch=best_epoch, hide_bg_dice=use_fg_acc,
             ylim=float(cfg.get("curve_ylim", 1.0)),
-            title="%s + %s @ %dx%d" % (cfg["arch"], cfg["encoder"], hw[0], hw[1]) + " — " + cfg["dataset"])
+            title="%s @ %dx%d" % (model_desc(cfg["arch"], cfg["encoder"]), hw[0], hw[1]) + " — " + cfg["dataset"])
         if curve_path:
             results["curves"] = str(curve_path)
             with open(run_dir / "results.json", "w", encoding="utf-8") as f:
@@ -599,8 +611,8 @@ def run(cfg):
     # ---- 训练结束汇总 ----
     best_cls = " | ".join("%s %.3f" % (_short(n, 10), d) for n, d in zip(names, best_metrics["dice"]))
     print("=" * W)
-    print("训练完成  |  %s + %s @ %dx%d  |  总用时 %s" % (
-        cfg["arch"], cfg["encoder"], hw[0], hw[1], _fmt_secs(time.time() - t0)))
+    print("训练完成  |  %s @ %dx%d  |  总用时 %s" % (
+        model_desc(cfg["arch"], cfg["encoder"]), hw[0], hw[1], _fmt_secs(time.time() - t0)))
     print("-" * W)
     lines = []
     _kv(lines, "最佳 epoch", "%d / %d%s" % (best_epoch, cfg["epochs"],

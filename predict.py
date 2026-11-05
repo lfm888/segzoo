@@ -23,7 +23,7 @@ import torch
 
 from dataset import (SPLIT_FILE, collect_pairs, mask_to_index, rasterize_labelme, read_mask,
                      read_split_txt, scan_label_info)
-from models import load_checkpoint
+from models import load_checkpoint, model_desc
 from utils import (IMG_EXTS, abspath, imwrite_unicode, load_image, normalize, parse_args,
                    render_prediction, resize_image, resolve_path, seg_metrics)
 
@@ -235,8 +235,8 @@ def main():
     if conf is not None and n_scored:
         m = seg_metrics(conf, C)
         print("\n" + "=" * 78)
-        print("最终评估（%s 段）| %s | %s + %s @ %dx%d | 统计 %d 张" % (
-            used_split, ckpt.parent.name, meta["arch"], meta["encoder"], hw[0], hw[1], n_scored))
+        print("最终评估（%s 段）| %s | %s @ %dx%d | 统计 %d 张" % (
+            used_split, ckpt.parent.name, model_desc(meta["arch"], meta["encoder"]), hw[0], hw[1], n_scored))
         print("-" * 78)
         print("  %-4s %-14s %-8s %-8s %-8s %-8s %-8s" % ("cls", "name", "Dice", "IoU", "P", "R", "F1"))
         for c in range(C):

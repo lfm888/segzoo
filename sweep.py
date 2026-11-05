@@ -10,7 +10,8 @@ import traceback
 
 import torch
 
-from models import RKNN_FRIENDLY_ARCHS, RKNN_FRIENDLY_ENCODERS
+from models import RKNN_FRIENDLY_ARCHS, RKNN_FRIENDLY_ENCODERS, model_desc, run_name
+from sota import sota_info
 from train import DEFAULTS as TRAIN_DEFAULTS, run
 from utils import abspath, parse_args, to_hw
 
@@ -28,6 +29,8 @@ DEFAULTS = {
     "batch_size": TRAIN_DEFAULTS["batch_size"],
     "runs_dir": TRAIN_DEFAULTS["runs_dir"],
     "device": TRAIN_DEFAULTS["device"],          # auto / cuda / cpu（无 GPU 时用 cpu 做快速对比）
+    # sota 模式：非空时架构维度固定为该模型。有可选骨干的模型遍历 encoders 列表；结构固定的（如 transunet）只跑 1 组
+    "sota_model": TRAIN_DEFAULTS["sota_model"],
 }
 # ===========================================================================
 
@@ -51,18 +54,35 @@ def pareto_flags(rows):
 def main():
     sw = parse_args(DEFAULTS, "批量对比 架构 x 编码器")
     base = dict(TRAIN_DEFAULTS)
-    for k in ("dataset", "data_root", "img_size", "in_channels", "batch_size", "runs_dir", "epochs", "device"):
+    for k in ("dataset", "data_root", "img_size", "in_channels", "batch_size", "runs_dir", "epochs", "device",
+              "sota_model"):
         base[k] = sw[k]
     hw = to_hw(base["img_size"])
     out_root = abspath(base["runs_dir"]) / base["dataset"]
 
     rows, failed = [], []
-    combos = [(a, e) for a in sw["archs"] for e in sw["encoders"]]
+    if base.get("sota_model"):
+        # sota 模式：架构由 sota_model 决定。有可选骨干的模型遍历 encoders；结构固定的只跑一组（骨干为空）
+        sota_name = str(base["sota_model"]).strip().lower()
+        info = sota_info(sota_name)                       # 名字不存在会直接报错
+        if info["backbones"]:
+            bad = [b for b in sw["encoders"] if b not in info["backbones"]]
+            if bad:
+                raise ValueError("%s 不支持骨干 %s，可选: %s" % (sota_name, bad, ", ".join(info["backbones"])))
+            combos = [(sota_name, b) for b in sw["encoders"]]
+            print("[sweep] sota_model=%s：架构固定，遍历骨干 %s" % (sota_name, sw["encoders"]))
+        else:
+            combos = [(sota_name, "")]
+            print("[sweep] sota_model=%s：%s，没有可选骨干，只跑 1 组" % (sota_name, info["desc"]))
+    else:
+        combos = [(a, e) for a in sw["archs"] for e in sw["encoders"]]
     t0 = time.time()
     for i, (arch, enc) in enumerate(combos, 1):
-        print("\n######## [%d/%d] %s + %s ########" % (i, len(combos), arch, enc))
+        print("\n######## [%d/%d] %s ########" % (i, len(combos), model_desc(arch, enc)))
         cfg = dict(base, arch=arch, encoder=enc)
-        done = out_root / ("%s_%s_%dx%d" % (arch, enc, hw[0], hw[1])) / "results.json"
+        if base.get("sota_model"):
+            cfg["sota_backbone"] = enc         # sota 模式下 enc 就是骨干名
+        done = out_root / run_name(arch, enc, hw[0], hw[1]) / "results.json"
         try:
             if sw["skip_done"] and done.exists():
                 import json

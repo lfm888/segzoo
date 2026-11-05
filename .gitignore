@@ -1,36 +1,33 @@
+# 训练产物
+runs/
+runs_*/
+
 # Python
 __pycache__/
 *.py[cod]
-*.pyd
-.Python
-.pytest_cache/
-.mypy_cache/
-
-# Virtual environments
-venv/
+*.egg-info/
 .venv/
+venv/
 env/
 
-# IDE
-.vscode/
-.idea/
+# 数据（体积大，且有隐私；只保留合成的小数据集 _demo_*）
+data/*
+!data/_demo_mask/
+!data/_demo_mask_ch/
+!data/_demo_labelme/
+!data/README.md
 
-# Training outputs
-runs/
-outputs/
-logs/
-checkpoints/
-weights/
+# 模型权重（体积大）
 *.pth
 *.pt
+*.ckpt
 *.onnx
 *.rknn
+*.npz
+sota/transunet/checkpoints/*.npz
 
-# Dataset
-datasets/
-data/
-
-# OS
+# 编辑器 / 系统
+.vscode/
+.idea/
 .DS_Store
 Thumbs.db
-desktop.ini

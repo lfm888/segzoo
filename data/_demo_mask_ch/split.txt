@@ -1,0 +1,30 @@
+# segzoo 数据划分 train/val/test：自动生成，可手工修改，删除后会重新生成
+# 生成时间 2026-11-05 15:57:46 | seed=42
+# 来源: 按 seed=42 随机划分（val_ratio=0.2, test_ratio=0.6）
+# params: {"seed": 42, "test_ratio": 0.6, "val_ratio": 0.2}
+# 共 24 张: train 5 / val 5 / test 14（train.py 只用 train+val，predict.py 默认用 test）
+# 格式: 文件名<TAB>split
+000.png	train
+001.png	test
+002.png	val
+003.png	train
+004.png	val
+005.png	test
+006.png	test
+007.png	train
+008.png	train
+009.png	val
+010.png	test
+011.png	test
+012.png	test
+013.png	test
+014.png	test
+015.png	test
+016.png	test
+017.png	test
+018.png	test
+019.png	val
+020.png	train
+021.png	test
+022.png	val
+023.png	test

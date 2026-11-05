@@ -7,3 +7,6 @@ huggingface_hub<0.26
 onnx
 onnxruntime
 matplotlib          # 训练结束画 loss / 准确率 / mDice / 各类 Dice 曲线图（curves.png）
+# SOTA 模型：TransUNet 的配置（ml_collections）；LiteSeg 的骨干也用 torchvision
+ml_collections
+scipy
