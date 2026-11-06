@@ -2,6 +2,11 @@
 
 一个轻量、高效且易于扩展的 PyTorch 图像分割训练与推理框架。支持经典 SMP（Segmentation Models PyTorch）模型，并内置了独立的 SOTA 前沿模型扩展（如 LiteSeg、TransUNet、YOLO11 语义分割）。
 
+- **换数据集、换模型都只改一个参数**：同一份数据、同一份划分，快速比较 `架构 × 编码器`，也可直接用 LiteSeg / TransUNet 等 SOTA 模型
+- **固定划分**：train / val / test 一次生成。训练只看 val，test 留给最终评估
+- **自动识别标签**：labelme `.json`、单通道索引 png、多通道 one-hot png
+- **可视化**：预测图一张看完原图、分割结果和真值轮廓；训练自动生成曲线图
+- **可部署**：归一化在模型外部完成（ONNX 不含归一化）；预处理实现在 `inference/`，与 C++ 逐行对应并附 golden 向量对拍
 ## 🌟 特点
 
 * **双模支持**：既支持标准 SMP 架构（UNet, FPN, DeepLabV3+ 等），也支持独立实现的 SOTA 模型（如 `sota/liteseg`、`sota/transunet`、`sota/yolo11`）。
