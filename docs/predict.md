@@ -57,11 +57,60 @@ python predict.py --save_vis false                   # 只要指标，不存图�
 python predict.py --max_images 8                     # 只跑前 8 张
 python predict.py --verbose                          # 打印 blob / logits 的形状与数值范围
 python predict.py --timing false                     # 不统计各阶段耗时
+python predict.py --complexity false                 # 不打印模型复杂度
+python predict.py --progress_bar false               # 不显示进度条
 ```
 
 > 布尔参数支持 `--flag`（等价 true）和 `--flag false` 两种写法。
 
-## 诊断输出
+## 输出顺序
+
+一次推理依次打印：模型信息 → 预热 → **模型复杂度** → **进度条** → **[timing]** → 指标表。
+
+### 进度条
+
+逐张推理时只显示一行进度（不再每张打一行）：
+
+```
+  predict [############------------] 5/10  50%  005.png  0m01s<0m01s
+```
+
+- 含文件名、百分比、已用时间与 ETA；非终端环境（重定向到文件）自动改为每 20% 一行。
+- `--progress_bar false` 关闭。
+
+### 模型复杂度
+
+在 `[timing]` 之前打印当前推理平台上的模型情况（`--complexity false` 关闭）：
+
+```
+============================================================
+模型复杂度统计
+============================================================
+参数总量      : 105,276,211 (105.276 M)
+可训练参数    : 105,276,211 (105.276 M)
+参数占用空间  : 401.60 MB
+参数数据类型分布:
+  - torch.float32       105,276,211 个 (105.276 M)  401.60 MB
+Buffer 数据类型分布（BN 统计量等，不计入参数量）:
+  - torch.float32             2,880 个  0.0110 MB
+  - torch.int64                   9 个  0.0001 MB
+统计输入尺寸  : (1, 1, 224, 224)  dtype=torch.float32
+计算量 MACs   : 29,182,377,984 (29.182 GMACs)
+计算量 FLOPs  : 58,364,755,968 (58.365 GFLOPs，FLOPs = 2 x MACs)
+统计方式      : torch.utils.flop_counter
+FLOPs 占比前几的算子:
+  - aten.addmm                   33.294 GFLOPs (57.0%)
+  - aten.convolution             23.654 GFLOPs (40.5%)
+  - aten.bmm                     1.416 GFLOPs (2.4%)
+============================================================
+```
+
+- 计算量用**与 ONNX 导出相同的输入尺寸**统计，`--verbose` 时额外打印算子占比。
+- `onnx` / `dnn` 后端也打印这份报告（结构与参数量相同，只是执行引擎不同）；用 `--onnx` 单独验证且没有
+  checkpoint 时会跳过并提示。
+- 实现是 `utils.print_model_complexity`，`train.py --complexity true` 也调用它。
+
+### 详细诊断
 
 `--verbose`（可选 `--verbose true`）只对第一张图打印，用来确认模型真的吃对了输入：
 
@@ -73,6 +122,8 @@ python predict.py --timing false                     # 不统计各阶段耗时
 - blob 的 range 明显偏离预期 → 预处理（mean/std）不对
 - logits 空间尺寸与输入不一致 → 模型或导出有问题
 - 输出通道数与 `num_classes` 不符 → 导出时的 classes 不对
+
+### 分阶段耗时
 
 `--timing`（默认开启）统计每张图各阶段平均耗时：
 

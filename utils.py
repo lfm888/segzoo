@@ -6,6 +6,8 @@
 import argparse
 import glob
 import os
+import sys
+import time
 from pathlib import Path
 
 import cv2
@@ -302,6 +304,163 @@ def render_prediction(img, mask, alpha=0.45, class_names=None, dash=0, gap=0, th
     if legend and class_names is not None and present:
         out = _draw_legend(out, present, colors, list(class_names), th, line_type)
     return out
+
+
+# --------------------------------------------------------------------------
+# 进度条 & 人类可读的数字 / 时间（train.py 与 predict.py 共用）
+# --------------------------------------------------------------------------
+def fmt_secs(s):
+    """秒 -> 人类可读（35s / 4m30s / 1h02m）"""
+    s = int(round(s))
+    if s < 60:
+        return "%ds" % s
+    if s < 3600:
+        return "%dm%02ds" % (s // 60, s % 60)
+    return "%dh%02dm" % (s // 3600, (s % 3600) // 60)
+
+
+def fmt_num(n):
+    """大数字 -> 紧凑单位：1_234 -> 1.234 K，105_275_921 -> 105.276 M"""
+    n = float(n)
+    for unit in ("", "K", "M", "G", "T"):
+        if abs(n) < 1000 or unit == "T":
+            return ("%.3f %s" % (n, unit)).strip() if unit else "%d" % n
+        n /= 1000.0
+
+
+class Progress:
+    """轻量进度条（不依赖 tqdm）：终端里 \r 原地刷新，非终端每 20% 打一行。
+
+    info 可以是任意短文本（训练传 "loss 0.123"，预测传文件名）。
+    """
+
+    def __init__(self, total, prefix="", enabled=True, info_fmt="%s"):
+        self.total, self.prefix, self.i, self.t0 = int(total), prefix, 0, time.time()
+        self.live = bool(enabled) and self.total > 0 and sys.stdout.isatty()
+        self.enabled = bool(enabled)
+        self.info_fmt = info_fmt
+        self._w = 0
+
+    def update(self, i, info=""):
+        self.i = i
+        if not self.enabled or self.total <= 0:
+            return
+        el = time.time() - self.t0
+        tail = ("  " + self.info_fmt % info) if str(info) else ""
+        if not self.live:
+            step = max(1, self.total // 5)
+            if i % step == 0 or i == self.total:
+                print("        %s %d/%d (%d%%)%s  用时 %s" % (
+                    self.prefix, i, self.total, 100 * i // self.total, tail, fmt_secs(el)))
+            return
+        frac = i / self.total
+        filled = int(24 * frac)
+        bar = "#" * filled + "-" * (24 - filled)
+        eta = el / max(frac, 1e-9) - el
+        line = "  %s [%s] %d/%d %3d%%%s  %s<%s" % (
+            self.prefix, bar, i, self.total, int(100 * frac), tail, fmt_secs(el), fmt_secs(eta))
+        self._w = max(self._w, len(line))
+        sys.stdout.write("\r" + line)
+        sys.stdout.flush()
+
+    def close(self):
+        if self.live:
+            sys.stdout.write("\r" + " " * (self._w + 1) + "\r")
+            sys.stdout.flush()
+
+
+# --------------------------------------------------------------------------
+# 模型复杂度：参数量（按 dtype）、Buffer、MACs / FLOPs、算子占比
+# --------------------------------------------------------------------------
+def print_model_complexity(model, in_channels, hw, device=None, top_ops=5, verbose=True):
+    """打印模型的参数量与计算量，便于跨平台 / 跨模型对比（train.py 和 predict.py 都会调用）。
+
+    - 参数量：model.parameters()，共享权重只算一次；按 dtype 分组
+    - Buffer：BN 的 running_mean/var 等，不算参数但占存储，单独列出
+    - 计算量：用与 ONNX 导出相同的输入尺寸做一次前向统计（FlopCounterMode），FLOPs = 2 x MACs
+    返回 {"params": 参数总量, "trainable": 可训练参数, "bytes": 参数字节数,
+          "macs": MACs 或 None, "flops": FLOPs 或 None}
+    """
+    import torch
+
+    device = device if device is not None else next(model.parameters()).device
+    h, w = int(hw[0]), int(hw[1])
+    bar = "=" * 60
+    print(bar)
+    print("模型复杂度统计")
+    print(bar)
+
+    # ---------- 1) 参数量，按 dtype 分组 ----------
+    by_dtype = {}                                    # dtype -> [个数, 字节数, 可训练个数]
+    for p in model.parameters():
+        rec = by_dtype.setdefault(p.dtype, [0, 0, 0])
+        rec[0] += p.numel()
+        rec[1] += p.numel() * p.element_size()
+        if p.requires_grad:
+            rec[2] += p.numel()
+    total_params = sum(r[0] for r in by_dtype.values())
+    total_bytes = sum(r[1] for r in by_dtype.values())
+    trainable = sum(r[2] for r in by_dtype.values())
+    print("参数总量      : %s (%s)" % (format(total_params, ","), fmt_num(total_params)))
+    print("可训练参数    : %s (%s)" % (format(trainable, ","), fmt_num(trainable)))
+    print("参数占用空间  : %.2f MB" % (total_bytes / 1024 / 1024))
+    if by_dtype:
+        print("参数数据类型分布:")
+        for dt, (n, b, _) in by_dtype.items():
+            print("  - %-16s %14s 个 (%s)  %.2f MB" % (str(dt), format(n, ","), fmt_num(n),
+                                                      b / 1024 / 1024))
+
+    # ---------- 2) Buffer ----------
+    buf_by_dtype = {}
+    for b in model.buffers():
+        rec = buf_by_dtype.setdefault(b.dtype, [0, 0])
+        rec[0] += b.numel()
+        rec[1] += b.numel() * b.element_size()
+    if buf_by_dtype:
+        print("Buffer 数据类型分布（BN 统计量等，不计入参数量）:")
+        for dt, (n, b) in buf_by_dtype.items():
+            print("  - %-16s %14s 个  %.4f MB" % (str(dt), format(n, ","), b / 1024 / 1024))
+
+    # ---------- 3) 计算量 ----------
+    dtype = next(model.parameters()).dtype if total_params else torch.float32
+    x = torch.zeros(1, int(in_channels), h, w, dtype=dtype, device=device)
+    print("统计输入尺寸  : (1, %d, %d, %d)  dtype=%s" % (int(in_channels), h, w, x.dtype))
+
+    was_training = model.training
+    model.eval()
+    flops, breakdown, method = None, None, None
+    try:
+        from torch.utils.flop_counter import FlopCounterMode
+        with torch.no_grad():
+            with FlopCounterMode(display=False) as fcm:
+                model(x)
+        flops = fcm.get_total_flops()
+        try:
+            breakdown = fcm.get_flop_counts().get("Global", None)
+        except Exception:
+            breakdown = None
+        method = "torch.utils.flop_counter"
+    except Exception as e:                            # 老版本 torch / 不支持的算子
+        if verbose:
+            print("[跳过计算量统计] %s: %s" % (type(e).__name__, e))
+    finally:
+        if was_training:
+            model.train()
+
+    macs = None
+    if flops:
+        macs = flops / 2
+        print("计算量 MACs   : %s (%sMACs)" % (format(int(macs), ","), fmt_num(macs)))
+        print("计算量 FLOPs  : %s (%sFLOPs，FLOPs = 2 x MACs)" % (format(int(flops), ","), fmt_num(flops)))
+        print("统计方式      : %s" % method)
+        if breakdown and verbose:
+            top = sorted(breakdown.items(), key=lambda kv: kv[1], reverse=True)[:top_ops]
+            print("FLOPs 占比前几的算子:")
+            for op, f in top:
+                print("  - %-28s %sFLOPs (%.1f%%)" % (str(op), fmt_num(f), f / flops * 100))
+    print(bar)
+    return {"params": total_params, "trainable": trainable, "bytes": total_bytes,
+            "macs": macs, "flops": flops}
 
 
 # --------------------------------------------------------------------------

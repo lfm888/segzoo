@@ -29,8 +29,8 @@ from dataset import INFO_FILE, build_datasets
 from models import benchmark_ms, build_model, count_gflops, model_desc, run_name, sota_spec
 from sota import sota_info
 from inference.preprocess import PreprocessSpec, argmax_mask, normalize, resize, to_blob
-from utils import (abspath, imwrite_unicode, parse_args, plot_training_curves, render_prediction,
-                   seg_metrics, to_hw)
+from utils import (Progress, abspath, fmt_secs, imwrite_unicode, parse_args, plot_training_curves,
+                   print_model_complexity, render_prediction, seg_metrics, to_hw)
 
 # ============================ 所有参数集中在这里 ============================
 DEFAULTS = {
@@ -42,8 +42,8 @@ DEFAULTS = {
     "json_merge_labels": False,       # labelme 里出现多个 label 名时，True=全部并成同一前景类
     "mask_mode": "auto",              # mask 标签编码：auto / index(单通道索引图) / channels(每通道=1类，AIDK 风格)
     "class_names": [],                # 可选类名（含背景也行）；空=自动读 <dataset>/classes.txt，没有则用默认名
-    "img_size": [128, 128],           # [H, W]，需为 32 的倍数。AIDK 常用 288,512；labelme 数据用 224,224 或 64,64
-    "in_channels": 1,                 # 1=灰度，3=RGB
+    "img_size": [224, 224],           # [H, W]，需为 32 的倍数。AIDK 常用 288,512；labelme 数据用 224,224 或 64,64
+    "in_channels": 3,                 # 1=灰度，3=RGB
     "num_classes": 0,                 # 含背景；0=自动（labelme 单类别 -> 2，AIDK 三通道 mask -> 4）
     "norm": "auto",                   # 输入归一化方式：
                                       #   auto     = 用预训练权重(encoder_weights!=none)时用 ImageNet 归一化，否则用下面的 mean/std
@@ -67,12 +67,12 @@ DEFAULTS = {
     "encoder": "resnet18",            # resnet18 / resnet34 / mobilenet_v2 / tu-xxx(timm 模型) ...
     # ---- SOTA 模型（sota/ 文件夹，如 LiteSeg）----
     # sota_model 非空 = 不使用上面的 arch / encoder，改用 sota/ 下的模型；可选名字见 sota/__init__.py
-    "sota_model": "liteseg",                 # 例如 "liteseg"；空字符串 = 使用 smp 的 arch + encoder
+    "sota_model": "transunet",                 # 例如 "liteseg"；空字符串 = 使用 smp 的 arch + encoder
     "sota_backbone": "resnet18",      # sota 模型的骨干（liteseg: resnet18/34/50/101/152 或 mobilenet_v2）
     "sota_act": "relu",               # sota 模型的激活函数（relu / leakyrelu / silu / hardswish ...）
     "encoder_weights": "imagenet",    # imagenet 或 none（下载失败会自动退回 none 并提示）
     # ---- 训练 ----
-    "epochs": 100,
+    "epochs": 20,
     "batch_size": 8,
     "lr": 1e-3,                       # 解码器/分割头学习率（编码器随机初始化时，编码器也用这个）
     "encoder_lr_mult": 0.1,           # 预训练编码器学习率 = lr * 该值（0.1 -> 1e-4）；1.0=不区分。
@@ -92,6 +92,7 @@ DEFAULTS = {
     "num_workers": 0,                 # 数据已缓存且增强很轻，Windows 下 0 最省事
     "device": "auto",                 # auto / cuda / cpu
     "progress_bar": True,             # 每个 epoch 内的进度条（终端里原地刷新，非终端每 20% 打一行）
+    "complexity": False,               # True = 训练前额外打印完整复杂度报告（按 dtype 的参数量/Buffer/算子占比）
     "curve_plot": True,                # 训练结束是否画 loss/准确率/mDice 曲线图 -> curves.png
     "curve_ylim": 1.0,                 # 曲线图 y 轴上限（0 = 自动）；超出的点会在图上标注出来
     "acc_exclude_bg": True,           # True = 打印/汇总里的 Acc 只统计前景像素（不含背景），
@@ -191,16 +192,6 @@ class Criterion(nn.Module):
         return self.ce(logits, y) + self.dice(logits, y)
 
 
-def _fmt_secs(s):
-    """秒 -> 人类可读（35s / 4m30s / 1h02m）"""
-    s = int(round(s))
-    if s < 60:
-        return "%ds" % s
-    if s < 3600:
-        return "%dm%02ds" % (s // 60, s % 60)
-    return "%dh%02dm" % (s // 3600, (s % 3600) // 60)
-
-
 def _short(name, n=12):
     """类名过长时截断，保证一行能放下"""
     name = str(name)
@@ -229,42 +220,6 @@ def evaluate(model, loader, criterion, device, num_classes, amp):
     m = conf_metrics(conf.view(num_classes, num_classes), num_classes)  # 行=真值 列=预测
     m["loss"] = loss_sum / max(n, 1)
     return m
-
-
-class Progress:
-    """轻量进度条（不依赖 tqdm）：终端里 \\r 原地刷新，非终端每 10% 打一行。"""
-
-    def __init__(self, total, prefix="train", enabled=True):
-        self.total, self.prefix, self.i, self.t0 = int(total), prefix, 0, time.time()
-        self.live = bool(enabled) and self.total > 0 and sys.stdout.isatty()
-        self.enabled = bool(enabled)
-        self._w = 0
-
-    def update(self, i, loss):
-        self.i = i
-        if not self.enabled or self.total <= 0:
-            return
-        el = time.time() - self.t0
-        if not self.live:
-            step = max(1, self.total // 5)
-            if i % step == 0 or i == self.total:
-                print("        %s %d/%d (%d%%)  loss %.4f  用时 %s" % (
-                    self.prefix, i, self.total, 100 * i // self.total, loss, _fmt_secs(el)))
-            return
-        frac = i / self.total
-        filled = int(24 * frac)
-        bar = "#" * filled + "-" * (24 - filled)
-        eta = el / max(frac, 1e-9) - el
-        line = "  %s [%s] %d/%d %3d%%  loss %.4f  %s<%s" % (
-            self.prefix, bar, i, self.total, int(100 * frac), loss, _fmt_secs(el), _fmt_secs(eta))
-        self._w = max(self._w, len(line))
-        sys.stdout.write("\r" + line)
-        sys.stdout.flush()
-
-    def close(self):
-        if self.live:
-            sys.stdout.write("\r" + " " * (self._w + 1) + "\r")
-            sys.stdout.flush()
 
 
 def _clean(v):
@@ -402,8 +357,8 @@ def print_epoch(ep, n_ep, tm, vm, names, lr, t_train, t_val, elapsed, eta, is_be
     cls_t = " | ".join("%s %.3f" % (_short(n, 10), d) for n, d in zip(names, tm["dice"]))
     print("-" * W)
     print("Epoch %3d/%-3d  lr %.2e  |  训练 %s + 验证 %s = %s  |  已用 %s  剩余 %s" % (
-        ep, n_ep, lr, _fmt_secs(t_train), _fmt_secs(t_val), _fmt_secs(t_train + t_val),
-        _fmt_secs(elapsed), _fmt_secs(eta)))
+        ep, n_ep, lr, fmt_secs(t_train), fmt_secs(t_val), fmt_secs(t_train + t_val),
+        fmt_secs(elapsed), fmt_secs(eta)))
     print("  %-6s %-9s %-9s %-9s %-9s %s" % ("phase", "loss", "mDice", "mIoU", acc_label, "各类 Dice"))
     print("  %-6s %-9.4f %-9.4f %-9.4f %-9.4f %s" % (
         "train", tm["loss"], tm["mdice"], tm["miou"], tm[acc_key], cls_t))
@@ -499,6 +454,8 @@ def run(cfg):
     ]
 
     # 训练前打印数据集、模型参数量/计算量、训练配置
+    if cfg.get("complexity"):
+        print_model_complexity(model, int(cfg["in_channels"]), hw, device)
     params_m, gflops = print_summary(cfg, info, train_ds, val_ds, train_loader, model, C, hw, device, amp, run_dir,
                                      norm_txt=norm_txt, extra_train_lines=extra_train_lines)
 
@@ -534,7 +491,7 @@ def run(cfg):
                 with torch.no_grad():  # 训练集指标顺便统计，便于对比是否过拟合
                     conf_t += torch.bincount(
                         (y * int(C) + logits.argmax(1)).flatten(), minlength=int(C) ** 2)
-                prog.update(i, tl / max(tn, 1))
+                prog.update(i, "loss %.4f" % (tl / max(tn, 1)))
             prog.close()
             t_train = time.time() - t_tr
             tm = conf_metrics(conf_t.view(int(C), int(C)), int(C))
@@ -615,7 +572,7 @@ def run(cfg):
     best_cls = " | ".join("%s %.3f" % (_short(n, 10), d) for n, d in zip(names, best_metrics["dice"]))
     print("=" * W)
     print("训练完成  |  %s @ %dx%d  |  总用时 %s" % (
-        model_desc(cfg["arch"], cfg["encoder"]), hw[0], hw[1], _fmt_secs(time.time() - t0)))
+        model_desc(cfg["arch"], cfg["encoder"]), hw[0], hw[1], fmt_secs(time.time() - t0)))
     print("-" * W)
     lines = []
     _kv(lines, "最佳 epoch", "%d / %d%s" % (best_epoch, cfg["epochs"],

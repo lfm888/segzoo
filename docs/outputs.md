@@ -64,6 +64,7 @@ mdice, miou, pacc, acc_fg, lr, dice_c0, dice_c1, ...
 | `label_smoothing` | `0.0` | CE 的 label smoothing，建议 0.05 |
 | `early_stop_patience` | `20` | 验证 mDice 连续多少轮无提升则停止，0 为关闭 |
 | `vis_samples` | `8` | 训练结束保存多少张验证集可视化 |
+| `complexity` | `false` | `true` = 训练前额外打印完整复杂度报告（按 dtype 的参数量 / Buffer / 算子占比） |
 | `progress_bar` | `true` | 进度条；非终端环境自动改为每 20% 输出一行 |
 
 参数的完整列表见 `train.py` 顶部的 `DEFAULTS`。

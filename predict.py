@@ -34,15 +34,15 @@ from dataset import (SPLIT_FILE, collect_pairs, mask_to_index, rasterize_labelme
 from inference.preprocess import (PreprocessSpec, argmax_mask, preprocess, read_image,
                                   resize_mask_nearest, to_model_color)
 from models import load_checkpoint, model_desc
-from utils import (IMG_EXTS, abspath, imwrite_unicode, parse_args, render_prediction, resize_image,
-                   resolve_path, seg_metrics)
+from utils import (IMG_EXTS, Progress, abspath, imwrite_unicode, parse_args,
+                   print_model_complexity, render_prediction, resize_image, resolve_path, seg_metrics)
 
 # ============================ 所有参数集中在这里 ============================
 DEFAULTS = {
     "ckpt": "latest",        # latest = runs 下最新的 best.pth
     "runs_dir": "runs",
     # ---- 推理后端 ----
-    "backend": "onnx",      # torch / onnx(onnxruntime) / dnn(OpenCV DNN)
+    "backend": "dnn",      # torch / onnx(onnxruntime) / dnn(OpenCV DNN)
     "onnx": "",              # 空 = 与 ckpt 同目录的 model.onnx；也可直接给 .onnx 路径
                              #      （同目录有 model_meta.json 时不需要 ckpt，用来单独验证导出的 ONNX）
     # ---- 输入 ----
@@ -57,6 +57,8 @@ DEFAULTS = {
     # ---- 诊断 ----
     "verbose": False,        # 打印第一张的 blob / logits 形状与数值范围（验证 ONNX 时很有用）
     "timing": True,          # 统计 preprocess / 推理 / 后处理 的平均耗时
+    "progress_bar": True,    # 逐张推理时显示进度条（非终端环境自动改为每 20% 一行）
+    "complexity": True,      # 打印模型参数量 / MACs / FLOPs（仅 torch 后端能做，onnx/dnn 见下方提示）
     # ---- 最终评估 ----
     "metrics": True,         # 有标签就算指标（Dice/IoU/P/R/F1），存 <out_dir>/metrics_<split>.json
     "save_vis": True,        # 是否保存 *_result.png（只要指标时可设 False 提速）
@@ -327,11 +329,23 @@ def main():
         runner(warm)
         print("[predict] 预热完成 %.1f ms（不计入统计）" % ((time.perf_counter() - t_w) * 1000))
 
+    # ---------- 模型复杂度（当前推理平台上的模型情况，放在逐张推理之前）----------
+    if cfg["complexity"]:
+        if model is not None:
+            print("[predict] 模型复杂度按 PyTorch 网络统计（backend=%s 只是执行引擎，结构与参数量相同）"
+                  % runner.name)
+            print_model_complexity(model, spec.in_channels, hw, device, verbose=bool(cfg["verbose"]))
+            print("[predict] 开始逐张推理（backend=%s）" % runner.name)
+        else:
+            print("[predict] backend=%s 没有 torch 模型，跳过复杂度统计"
+                  "（ONNX/DNN 的计算量可在 torch 后端下查看）" % runner.name)
+
     # ---------- 逐张预测 ----------
     conf = np.zeros((C, C), dtype=np.int64) if (info is not None and label_of) else None
     n_scored = 0
     edge_mode = str(cfg["edge"]).lower()
     t_pre = t_inf = t_post = 0.0
+    prog = Progress(len(files), "predict", enabled=bool(cfg["progress_bar"]))
     for k, p in enumerate(files, 1):
         # C++ 里的等价流程：cv::imread -> cvtColor -> resize -> (x-mean)/std -> blobFromImage
         t0 = time.perf_counter()
@@ -381,8 +395,8 @@ def main():
                 print("[warn] 输出空间尺寸 %s 与输入 %s 不一致，请检查模型" % (
                     tuple(np.shape(logits))[-2:], hw))
 
-        print("  [%d/%d] %s%s" % (k, len(files), p.name,
-                                 "" if gt_hw is not None else ("  (无标签)" if info else "")))
+        prog.update(k, p.name if gt_hw is not None or info is None else "%s (无标签)" % p.name)
+    prog.close()
 
     # ---------- 耗时统计 ----------
     if cfg["timing"] and files:
