@@ -42,7 +42,7 @@ DEFAULTS = {
     "json_merge_labels": False,       # labelme 里出现多个 label 名时，True=全部并成同一前景类
     "mask_mode": "auto",              # mask 标签编码：auto / index(单通道索引图) / channels(每通道=1类，AIDK 风格)
     "class_names": [],                # 可选类名（含背景也行）；空=自动读 <dataset>/classes.txt，没有则用默认名
-    "img_size": [64, 64],           # [H, W]，需为 32 的倍数。AIDK 常用 288,512；labelme 数据用 224,224 或 64,64
+    "img_size": [128, 128],           # [H, W]，需为 32 的倍数。AIDK 常用 288,512；labelme 数据用 224,224 或 64,64
     "in_channels": 1,                 # 1=灰度，3=RGB
     "num_classes": 0,                 # 含背景；0=自动（labelme 单类别 -> 2，AIDK 三通道 mask -> 4）
     # 输入归一化固定为 ImageNet（不是命令行参数，norm/mean/std 已移除）：
@@ -64,12 +64,12 @@ DEFAULTS = {
     # ---- SOTA 模型（sota/ 文件夹，如 LiteSeg）----
     # sota_model 非空 = 不使用上面的 arch / encoder，改用 sota/ 下的模型；可选名字见 sota/__init__.py
     "sota_model": "yolo11",                 # 例如 "liteseg"；空字符串 = 使用 smp 的 arch + encoder
-    "sota_backbone": "m",      # sota 模型的骨干（liteseg: resnet18/34/50/101/152 或 mobilenet_v2）
+    "sota_backbone": "s",      # sota 模型的骨干（liteseg: resnet18/34/50/101/152 或 mobilenet_v2）
     "sota_act": "silu",               # sota 模型的激活函数（relu / leakyrelu / silu / hardswish ...）
     "encoder_weights": "imagenet",    # imagenet 或 none（下载失败会自动退回 none 并提示）
     # ---- 训练 ----
-    "epochs": 20,
-    "batch_size": 8,
+    "epochs": 100,
+    "batch_size": 16,
     "lr": 1e-3,                       # 解码器/分割头学习率（编码器随机初始化时，编码器也用这个）
     "encoder_lr_mult": 0.1,           # 预训练编码器学习率 = lr * 该值（0.1 -> 1e-4）；1.0=不区分。
                                       # 只在 encoder_weights 不是 none 时生效（随机初始化的编码器不该降学习率）
