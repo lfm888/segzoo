@@ -79,9 +79,14 @@ python predict.py                                    # 在 test 段做最终评�
 
 ```bash
 python export_onnx.py                   # best.pth → model.onnx（+ model_meta.json，含预处理规格）
-python predict.py --backend onnx        # 用 ONNX 再评估一遍，确认前后处理一致
+python predict.py --backend onnx        # onnxruntime 再评估一遍，确认前后处理一致
+python predict.py --backend dnn         # OpenCV DNN（与 C++ 部署同一套算子）
 python inference/preprocess.py          # 预处理自检 + 生成 golden 向量（给 C++ 对拍）
 ```
+
+三种后端（`torch` / `onnx` / `dnn`）共用同一份预处理，指标应几乎一致。
+只要有 ONNX + `model_meta.json`（不需要 checkpoint）就能验证：
+`python predict.py --onnx out/model.onnx --backend dnn`
 
 ONNX 的输入是**已经归一化**的 `1xCxHxW float32`，C++ 侧照
 [docs/preprocess.md](docs/preprocess.md) 的五个步骤实现即可（每步都有对应的 OpenCV 调用）。
@@ -109,7 +114,7 @@ ONNX 的输入是**已经归一化**的 `1xCxHxW float32`，C++ 侧照
 | `dataset.py` | 只生成 `split.txt` 和 `label_info.txt`，不训练 |
 | `train.py` | 训练单个模型，输出权重、日志、曲线和可视化 |
 | `sweep.py` | 批量训练 架构 × 编码器，输出排行榜与帕累托 |
-| `predict.py` | 预测；有标签时计算指标；默认在 test 段评估 |
+| `predict.py` | 预测 / 最终评估 / **ONNX 验证**（torch、onnxruntime、OpenCV DNN 三种后端） |
 | `export_onnx.py` | 导出 ONNX 并校验 |
 
 每个脚本的参数都集中在文件顶部的 `DEFAULTS` 字典里（`dataset.py` 为 `PREP_DEFAULTS`）。可以直接改默认值，也可以在命令行覆盖：
@@ -126,7 +131,7 @@ python train.py --acc_exclude_bg false            # 布尔参数传 true / false
 | [docs/data.md](docs/data.md) | 数据格式、标签编码、类别名、标签缓存 |
 | [docs/split.md](docs/split.md) | train / val / test 划分规则与自动重划 |
 | [docs/outputs.md](docs/outputs.md) | 训练输出、日志字段、指标与曲线图说明 |
-| [docs/predict.md](docs/predict.md) | 预测输入模式、可视化约定、最终评估 |
+| [docs/predict.md](docs/predict.md) | 三种推理后端、只验证 ONNX、诊断输出、可视化与最终评估 |
 | [docs/sota.md](docs/sota.md) | SOTA 模型（LiteSeg / TransUNet）的用法、迁移说明、如何新增模型 |
 | [docs/preprocess.md](docs/preprocess.md) | 统一预处理接口、C++ 对应关系、golden 向量对拍 |
 

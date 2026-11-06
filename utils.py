@@ -43,7 +43,8 @@ def parse_args(defaults, description=None):
     for k, v in defaults.items():
         flag = "--" + k
         if isinstance(v, bool):  # 必须先于 int 判断（bool 是 int 的子类）
-            p.add_argument(flag, type=_str2bool, default=v)
+            # nargs="?" 让 "--flag"（等价 true）和 "--flag false" 两种写法都可用
+            p.add_argument(flag, type=_str2bool, nargs="?", const=True, default=v)
         elif isinstance(v, (list, tuple)):
             et = type(v[0]) if len(v) else str
             # 列表参数用逗号分隔：--img_size 288,512  --archs unet,fpn
