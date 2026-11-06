@@ -13,10 +13,12 @@
 """
 from .liteseg import liteseg
 from .transunet import transunet
+from .yolo11 import yolo11
 
 SOTA_MODELS = {
     "liteseg": liteseg,
     "transunet": transunet,
+    "yolo11": yolo11,          # 【新增】登记 YOLO11
 }
 
 # backbones 为空 = 结构固定，没有可选骨干（sota_backbone 必须留空）
@@ -27,6 +29,10 @@ SOTA_INFO = {
                     uses_act=True, square=False, divisor=None),
     "transunet": dict(desc="TransUNet：R50 + ViT-B/16",
                       backbones=[], uses_act=False, square=True, divisor=16),
+    # 【新增】YOLO11 的配置说明与合法骨干（档位）
+    "yolo11": dict(desc="YOLO11 Semantic Segmentation",
+                   backbones=["n", "s", "m", "l", "x", "n-nopsa", "s-nopsa", "m-nopsa", "l-nopsa", "x-nopsa"],
+                   uses_act=True, square=False, divisor=32),
 }
 
 
