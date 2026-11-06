@@ -91,15 +91,12 @@ sota/transunet/checkpoints/R50+ViT-B_16.npz
 
 | 项目 | 源项目 | segzoo |
 |---|---|---|
-| 输入归一化 | 原始 0–255，不归一化 | 由 `norm` 决定（默认 `auto`：预训练时用 ImageNet 标准化） |
+| 输入归一化 | 原始 0–255，不归一化 | 统一 ImageNet 标准化（`inference/preprocess.py` 的 `imagenet_norm`，灰度取三通道均值近似） |
 | 骨干预训练 | 不使用 | 由 `encoder_weights` 决定（默认 `imagenet`，离线时自动退回随机初始化） |
 | 学习率 | 统一 | 预训练骨干用 `lr × encoder_lr_mult`（默认 0.1），与 smp 模型一致 |
 
-要和源项目完全一致地复现：
-
-```bash
-python train.py --sota_model liteseg --encoder_weights none --norm custom --mean 0 --std 1
-```
+源项目不做归一化，而 segzoo **统一使用 ImageNet 归一化**（`norm` / `--mean` / `--std` 已移除），
+所以“完全一致地复现源项目训练”已不再支持；结构与权重仍与源项目一致（见下）：
 
 ### 迁移时的改动（已验证）
 

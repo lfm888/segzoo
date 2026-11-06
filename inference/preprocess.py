@@ -16,6 +16,8 @@
   5     to_blob      HWC -> 1xCxHxW，float32，连续内存          cv::dnn::blobFromImage(f, 1.0, cv::Size(), cv::Scalar(), false, false, CV_32F)
 
 注意：
+  * 归一化统一用 ImageNet 统计量（见下面的 IMAGENET_MEAN / IMAGENET_STD，灰度取三通道均值近似），
+    不再提供其它归一化方式；实际使用的 mean/std 由训练端写进 meta，本文件只读它。
   * 第 4 步不能用 blobFromImage 的 mean/scalefactor 代替：scalefactor 只能是标量，而 3 通道的 std 逐通道不同。
     所以 C++ 里用 cv::subtract / cv::divide + Scalar 逐通道处理（mean/std 通道顺序 = RGB 顺序，因为第 2 步已经转成 RGB），
     最后的 blobFromImage 只做 HWC->NCHW 的排布变换（swapRB=false，mean 为空，scalefactor=1）。
@@ -41,6 +43,23 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parent.parent  # segzoo 仓库根目录（inference/ 的上一级）
 
+# ============================ 归一化：全仓统一用 ImageNet（唯一方式） ============================
+# 0~255 单位，通道顺序 RGB，与 RKNN config 的 mean_values/std_values 同一量纲
+IMAGENET_MEAN = (123.675, 116.28, 103.53)
+IMAGENET_STD = (58.395, 57.12, 57.375)
+
+
+def imagenet_norm(in_channels):
+    """归一化统一用 ImageNet，返回 (mean, std) 列表：3 通道用完整三元组，
+    灰度取三通道均值/标准差作近似（与 smp 把预训练 conv1 的三通道权重求和用于单通道输入一致）。"""
+    c = int(in_channels)
+    if c == 3:
+        return list(IMAGENET_MEAN), list(IMAGENET_STD)
+    if c == 1:
+        return [sum(IMAGENET_MEAN) / 3.0], [sum(IMAGENET_STD) / 3.0]
+    raise ValueError("in_channels 只支持 1 或 3，当前 %r" % in_channels)
+
+
 # ============================ 所有参数集中在这里 ============================
 DEFAULTS = {
     "meta": "latest",                 # model_meta.json / best.pth 同目录导出的元数据；latest = runs 下最新的 model_meta.json
@@ -49,11 +68,9 @@ DEFAULTS = {
     "out_dir": "inference/golden",    # golden 向量输出目录（相对仓库根目录）
     "save_golden": True,              # 是否保存 golden 向量
     "check_against_training": True,   # 与训练端 utils.load_image/resize_image/normalize 逐元素对比（需要在仓库里运行）
-    # 下面四项仅在找不到 meta 时作为备用（没训练过模型也能先跑自检）
+    # 下面两项仅在找不到 meta 时作为备用（没训练过模型也能先跑自检）；归一化固定用 ImageNet，不再可配
     "in_channels": 1,
     "img_size": [288, 512],           # [H, W]
-    "mean": [127.5],
-    "std": [127.5],
 }
 # ===========================================================================
 
@@ -235,7 +252,7 @@ def _abs(p):
 
 
 def _load_spec(cfg):
-    """优先从 meta 构造规格；找不到就用 DEFAULTS 里的备用值。返回 (spec, 来源说明)。"""
+    """优先从 meta 构造规格；找不到就用 ImageNet 归一化的备用值。返回 (spec, 来源说明)。"""
     path = None
     if cfg["meta"] in ("", "latest"):
         cands = glob.glob(str(_abs(cfg["runs_dir"]) / "**" / "model_meta.json"), recursive=True)
@@ -246,8 +263,9 @@ def _load_spec(cfg):
             raise FileNotFoundError("meta 文件不存在: %s" % path)
     if path is not None:
         return PreprocessSpec.from_meta(json.loads(path.read_text(encoding="utf-8"))), "meta: %s" % path
-    spec = PreprocessSpec(cfg["in_channels"], cfg["img_size"], cfg["mean"], cfg["std"])
-    return spec, "DEFAULTS 备用值（没找到 model_meta.json）"
+    mean, std = imagenet_norm(cfg["in_channels"])
+    spec = PreprocessSpec(cfg["in_channels"], cfg["img_size"], mean, std)
+    return spec, "ImageNet 归一化备用值（没找到 model_meta.json）"
 
 
 def _synthetic(channels, hw, seed=0):

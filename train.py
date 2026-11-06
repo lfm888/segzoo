@@ -6,7 +6,7 @@
 本版新增（针对“前几轮验证 loss 异常偏高、验证指标抖动”）：
   1) 逐步线性 warmup + 逐步余弦退火（warmup_epochs / warmup_start_factor / min_lr_factor）
   2) 预训练编码器与解码器分层学习率（encoder_lr_mult）
-  3) 预训练权重时自动用 ImageNet 归一化（norm=auto/imagenet/custom），meta 里记录实际 mean/std，
+  3) 归一化统一用 ImageNet（灰度取三通道均值近似），meta 里记录实际 mean/std，
      predict / export_onnx / convert_rknn 读 meta，自动保持一致
   4) 可选早停（early_stop_patience，默认关闭）
 """
@@ -28,7 +28,7 @@ import segmentation_models_pytorch as smp
 from dataset import INFO_FILE, build_datasets
 from models import benchmark_ms, build_model, count_gflops, model_desc, run_name, sota_spec
 from sota import sota_info
-from inference.preprocess import PreprocessSpec, argmax_mask, normalize, resize, to_blob
+from inference.preprocess import PreprocessSpec, argmax_mask, imagenet_norm, normalize, resize, to_blob
 from utils import (Progress, abspath, fmt_secs, imwrite_unicode, parse_args, plot_training_curves,
                    print_model_complexity, render_prediction, seg_metrics, to_hw)
 
@@ -45,13 +45,9 @@ DEFAULTS = {
     "img_size": [64, 64],           # [H, W]，需为 32 的倍数。AIDK 常用 288,512；labelme 数据用 224,224 或 64,64
     "in_channels": 1,                 # 1=灰度，3=RGB
     "num_classes": 0,                 # 含背景；0=自动（labelme 单类别 -> 2，AIDK 三通道 mask -> 4）
-    "norm": "auto",                   # 输入归一化方式：
-                                      #   auto     = 用预训练权重(encoder_weights!=none)时用 ImageNet 归一化，否则用下面的 mean/std
-                                      #   imagenet = 强制 ImageNet 归一化（3 通道: mean=[123.675,116.28,103.53] std=[58.395,57.12,57.375]；
-                                      #              灰度: 取三通道均值作近似）
-                                      #   custom   = 用下面的 mean/std
-    "mean": [127.5],                  # norm=custom 时使用；(x-mean)/std，0~255 单位；RKNN 转换会读 meta 里实际使用的值
-    "std": [127.5],
+    # 输入归一化固定为 ImageNet（不是命令行参数，norm/mean/std 已移除）：
+    #   3 通道 mean=[123.675,116.28,103.53] std=[58.395,57.12,57.375]；灰度: 取三通道均值作近似
+    #   (x-mean)/std，0~255 单位；实际使用的值由 resolve_norm 算出并写进 meta（RKNN 转换会读 meta）
     "val_ratio": 0.1,                 # 仅用于首次生成 split.txt：验证集占比
     "test_ratio": 0.1,                # 仅用于首次生成 split.txt：测试集占比（train.py 不碰 test，留给 predict.py 评估）
     "split_file": "split.txt",        # 固定划分文件（相对数据集目录）；空字符串=不落盘
@@ -67,7 +63,7 @@ DEFAULTS = {
     "encoder": "resnet18",            # resnet18 / resnet34 / mobilenet_v2 / tu-xxx(timm 模型) ...
     # ---- SOTA 模型（sota/ 文件夹，如 LiteSeg）----
     # sota_model 非空 = 不使用上面的 arch / encoder，改用 sota/ 下的模型；可选名字见 sota/__init__.py
-    "sota_model": "",                 # 例如 "liteseg"；空字符串 = 使用 smp 的 arch + encoder
+    "sota_model": "liteseg",                 # 例如 "liteseg"；空字符串 = 使用 smp 的 arch + encoder
     "sota_backbone": "resnet18",      # sota 模型的骨干（liteseg: resnet18/34/50/101/152 或 mobilenet_v2）
     "sota_act": "relu",               # sota 模型的激活函数（relu / leakyrelu / silu / hardswish ...）
     "encoder_weights": "imagenet",    # imagenet 或 none（下载失败会自动退回 none 并提示）
@@ -117,9 +113,8 @@ DEFAULTS = {
 }
 # ===========================================================================
 
-# ImageNet 统计量（0~255 单位，与 RKNN config 的 mean_values/std_values 同一量纲）
-IMAGENET_MEAN = [123.675, 116.28, 103.53]
-IMAGENET_STD = [58.395, 57.12, 57.375]
+# ImageNet 统计量定义在 inference/preprocess.py（IMAGENET_MEAN / IMAGENET_STD / imagenet_norm），
+# 训练端、推理端、C++ 只有这一份，这里只负责按通道数取用并写进 meta。
 
 
 def set_seed(s):
@@ -130,22 +125,12 @@ def set_seed(s):
 
 
 def resolve_norm(cfg):
-    """决定实际使用的归一化 (mean, std, 说明文字)。
-    预训练编码器是在 ImageNet 归一化的输入上训练的，输入分布差太多会让前几轮的 BN 统计量/特征严重错位。"""
-    mode = str(cfg.get("norm", "auto")).lower()
-    if mode not in ("auto", "imagenet", "custom"):
-        raise ValueError("norm 只能是 auto / imagenet / custom，当前: %r" % cfg.get("norm"))
-    pretrained = str(cfg["encoder_weights"]).lower() not in ("none", "")
-    use_imagenet = mode == "imagenet" or (mode == "auto" and pretrained)
+    """归一化统一用 ImageNet，返回 (mean, std, 说明文字)；实际值写进 meta 供 predict/export/rknn 读取。
+    预训练编码器是在 ImageNet 归一化的输入上训练的，输入分布差太多会让前几轮的 BN 统计量/特征严重错位；
+    灰度输入取三通道均值/标准差作近似（与 smp 把预训练 conv1 的三通道权重求和一致）。"""
     c = int(cfg["in_channels"])
-    if use_imagenet and c == 3:
-        return list(IMAGENET_MEAN), list(IMAGENET_STD), "imagenet"
-    if use_imagenet and c == 1:
-        # smp 会把预训练 conv1 的三通道权重求和用于单通道输入，这里用三通道均值/标准差近似
-        return [sum(IMAGENET_MEAN) / 3.0], [sum(IMAGENET_STD) / 3.0], "imagenet(灰度近似)"
-    if use_imagenet:
-        print("[warn] in_channels=%d 没有对应的 ImageNet 归一化，改用 custom mean/std" % c)
-    return [float(v) for v in cfg["mean"]], [float(v) for v in cfg["std"]], "custom"
+    mean, std = imagenet_norm(c)
+    return mean, std, "imagenet" if c == 3 else "imagenet(灰度近似)"
 
 
 def make_lr_lambda(total, warm, start, min_f):
@@ -317,7 +302,7 @@ def print_summary(cfg, info, train_ds, val_ds, train_loader, model, C, hw, devic
         else "本次重新扫描（已缓存到 %s）" % INFO_FILE)
     _kv(lines, "输入", "%d 通道 @ %dx%d" % (cfg["in_channels"], hw[0], hw[1]))
     _kv(lines, "归一化", "%s   mean=%s  std=%s" % (
-        norm_txt or "custom", [round(v, 3) for v in cfg["mean"]], [round(v, 3) for v in cfg["std"]]))
+        norm_txt or "imagenet", [round(v, 3) for v in cfg["mean"]], [round(v, 3) for v in cfg["std"]]))
     print("\n".join(lines))
 
     _section("2/4 模型")

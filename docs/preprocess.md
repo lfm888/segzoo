@@ -42,13 +42,16 @@
 一份“契约”，训练时写进 checkpoint 的 `meta` 与 `model_meta.json`，推理端只读它：
 
 ```python
-from inference.preprocess import PreprocessSpec
+from inference.preprocess import PreprocessSpec, imagenet_norm
 
-spec = PreprocessSpec(in_channels=1, img_size=(224, 224), mean=(127.5,), std=(127.5,))
-spec = PreprocessSpec.from_meta(meta)     # 从 meta / model_meta.json 构造
+mean, std = imagenet_norm(3)             # ImageNet: [123.675, 116.28, 103.53] / [58.395, 57.12, 57.375]
+spec = PreprocessSpec(in_channels=3, img_size=(224, 224), mean=mean, std=std)
+spec = PreprocessSpec.from_meta(meta)    # 从 meta / model_meta.json 构造
 ```
 
 - `mean` / `std` 是 **0~255 单位**，通道顺序 **RGB**，长度可以是 1（自动广播到所有通道）或 `in_channels`。
+- **归一化统一用 ImageNet**（`imagenet_norm(in_channels)`，全仓唯一方式）：3 通道用完整三元组，
+  灰度取三通道均值/标准差作近似（`mean≈114.495`、`std≈57.63`）。没有 `norm`/`mean`/`std` 命令行参数。
 - 长度既不是 1 也不是 `in_channels` 时直接报错，不再静默忽略。
 
 ## 后处理
@@ -65,8 +68,7 @@ spec = PreprocessSpec.from_meta(meta)     # 从 meta / model_meta.json 构造
 ```bash
 python inference/preprocess.py                                        # 用最新 model_meta.json
 python inference/preprocess.py --image data/xxx/train_dataset/001.png
-python inference/preprocess.py --in_channels 3 --img_size 224,224 \
-       --mean 123.675,116.28,103.53 --std 58.395,57.12,57.375        # 没有 meta 时
+python inference/preprocess.py --in_channels 3 --img_size 224,224    # 没有 meta 时（自动用 ImageNet 归一化）
 ```
 
 检查项：
