@@ -17,15 +17,16 @@
 """
 import json
 
-import cv2
 import numpy as np
 import torch
 
 from dataset import (SPLIT_FILE, collect_pairs, mask_to_index, rasterize_labelme, read_mask,
                      read_split_txt, scan_label_info)
+from inference.preprocess import (PreprocessSpec, argmax_mask, preprocess, read_image,
+                                  resize_mask_nearest, to_model_color)
 from models import load_checkpoint, model_desc
-from utils import (IMG_EXTS, abspath, imwrite_unicode, load_image, normalize, parse_args,
-                   render_prediction, resize_image, resolve_path, seg_metrics)
+from utils import (IMG_EXTS, abspath, imwrite_unicode, parse_args, render_prediction, resize_image,
+                   resolve_path, seg_metrics)
 
 # ============================ 所有参数集中在这里 ============================
 DEFAULTS = {
@@ -149,7 +150,8 @@ def main():
     use_cuda = torch.cuda.is_available() and cfg["device"] != "cpu"
     device = torch.device("cuda" if use_cuda else "cpu")
     model, meta = load_checkpoint(ckpt, device)
-    hw = tuple(meta["img_size"])
+    spec = PreprocessSpec.from_meta(meta)        # 预处理规格：与训练 / ONNX / C++ 同一份契约
+    hw = tuple(spec.img_size)
     C = int(meta["num_classes"])
     class_names = list(meta.get("class_names") or [])
     class_names += ["class_%d" % i for i in range(len(class_names), C)]
@@ -197,14 +199,17 @@ def main():
     n_scored = 0
     edge_mode = str(cfg["edge"]).lower()
     for k, p in enumerate(files, 1):
-        raw = load_image(p, meta["in_channels"])
-        x = normalize(resize_image(raw, hw), meta["mean"], meta["std"])[None]
+        # C++ 里的等价流程：cv::imread -> cvtColor -> resize -> (x-mean)/std -> blobFromImage
+        raw_bgr = read_image(p, spec.in_channels)            # 步骤 1：原分辨率 BGR / 灰度
+        x = preprocess(raw_bgr, spec)                        # 步骤 1~5：1xCxHxW float32
+        raw = to_model_color(raw_bgr, spec.in_channels)      # 供可视化（RGB / 灰度，仍是原分辨率）
+
         if sess is not None:
             logits = sess.run(None, {"input": x})[0]
         else:
             with torch.no_grad():
                 logits = model(torch.from_numpy(x).to(device)).cpu().numpy()
-        pred = logits[0].argmax(0).astype(np.uint8)          # 模型输入尺寸上的预测
+        pred = argmax_mask(logits)                           # 模型输入尺寸上的预测（argmax 取第一个最大值）
 
         gt_hw, gt_full = None, None
         if info is not None and p.name in label_of:
@@ -214,9 +219,9 @@ def main():
 
         if cfg["save_vis"]:
             # 与训练可视化一致：都画在原图分辨率上（最近邻放大，不产生新类别）
-            full = cv2.resize(pred, (raw.shape[1], raw.shape[0]), interpolation=cv2.INTER_NEAREST)
+            full = resize_mask_nearest(pred, raw.shape[:2])
             if gt_hw is not None:
-                gt_full = cv2.resize(gt_hw, (raw.shape[1], raw.shape[0]), interpolation=cv2.INTER_NEAREST)
+                gt_full = resize_mask_nearest(gt_hw, raw.shape[:2])
             if edge_mode == "pred":
                 edge_mask, draw = full, True
             elif edge_mode in ("none", "off", "false") or (edge_mode in ("auto", "gt") and gt_full is None):

@@ -11,6 +11,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from inference import preprocess as pp   # 预处理单一来源（纯 numpy/cv2，无循环依赖）
+
 ROOT = Path(__file__).resolve().parent  # 本框架所在目录
 
 
@@ -100,33 +102,31 @@ def imwrite_unicode(path, img):
     buf.tofile(str(path))
 
 
+# 预处理实现统一在 inference/preprocess.py（推理端与 C++ 的唯一契约），下面三个函数只是薄封装，
+# 保留是为了兼容旧的调用习惯。数值与推理端逐元素一致，不要再在这里写第二份实现。
 def load_image(path, in_channels):
-    """in_channels=1 读灰度 HxW；否则读 RGB HxWx3。均为 uint8。"""
-    if in_channels == 1:
-        return imread_unicode(path, cv2.IMREAD_GRAYSCALE)
-    return cv2.cvtColor(imread_unicode(path, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
+    """in_channels=1 读灰度 HxW；否则读 RGB HxWx3。均为 uint8。等价于 inference.preprocess.load_model_image。"""
+    return pp.load_model_image(path, in_channels)
 
 
 def resize_image(img, hw, is_mask=False):
+    """图像：走推理端同一套插值规则（缩小用 INTER_AREA，否则 INTER_LINEAR）；
+    mask：最近邻（不产生新类别），只在训练/评估端使用，不属于推理流水线。"""
     h, w = hw
     if img.shape[0] == h and img.shape[1] == w:
         return img
     if is_mask:
         return cv2.resize(img, (w, h), interpolation=cv2.INTER_NEAREST)
-    shrink = img.shape[0] > h or img.shape[1] > w
-    return cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA if shrink else cv2.INTER_LINEAR)
+    return pp.resize(img, (h, w))
 
 
 def normalize(img, mean, std):
-    """(x - mean) / std，mean/std 以 0~255 为单位（与 RKNN config 的 mean/std 一致）。
-    返回 float32 的 CxHxW。"""
+    """(x - mean) / std，mean/std 以 0~255 为单位，返回 float32 的 CxHxW。
+    等价于 inference.preprocess.normalize(...).transpose(2,0,1)。"""
     x = img.astype(np.float32)
-    if x.ndim == 2:
-        x = x[..., None]
-    c = x.shape[2]
-    m = np.array(mean if len(mean) == c else [mean[0]] * c, dtype=np.float32)
-    s = np.array(std if len(std) == c else [std[0]] * c, dtype=np.float32)
-    return np.ascontiguousarray(((x - m) / s).transpose(2, 0, 1))
+    c = 1 if x.ndim == 2 else x.shape[2]
+    spec = pp.PreprocessSpec(c, (1, 1), mean, std)      # normalize 不用 img_size，占位即可
+    return np.ascontiguousarray(pp.normalize(x, spec).transpose(2, 0, 1))
 
 
 # --------------------------------------------------------------------------

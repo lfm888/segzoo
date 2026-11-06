@@ -31,8 +31,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from utils import (IMG_EXTS, ROOT, abspath, imread_unicode, load_image, normalize, parse_args,
-                   resize_image, to_hw)
+from inference.preprocess import PreprocessSpec, load_model_image, normalize, resize, to_blob
+from utils import IMG_EXTS, ROOT, abspath, imread_unicode, parse_args, resize_image, to_hw
 
 MASK_SUFFIXES = ["", "_mask", "_label", "_labels", "_gt", "_seg", "-mask", "-label"]
 CLASS_FILES = ("classes.txt", "classes.json")  # 可选的类别名文件
@@ -588,6 +588,9 @@ class SegDataset(Dataset):
         self.pairs, self.info = pairs, info
         self.hw = to_hw(img_size)
         self.in_channels, self.mean, self.std, self.aug = in_channels, mean, std, aug
+        # 预处理规格（in_channels / img_size / mean / std）统一由 inference.preprocess 定义，
+        # 训练、predict、ONNX、C++ 用的是同一份契约
+        self.spec = PreprocessSpec(in_channels, self.hw, mean, std)
         self._cache = [None] * len(pairs)
         if cache:  # 先一次性解码+缩放到目标尺寸放内存，训练时不再反复解码大图
             for i in range(len(pairs)):
@@ -595,12 +598,13 @@ class SegDataset(Dataset):
 
     def _load(self, i):
         ip, lp = self.pairs[i]
-        img = load_image(ip, self.in_channels)
+        img = load_model_image(ip, self.in_channels)      # 步骤 1+2：读图 + 转成模型色彩（RGB / 灰度）
         if self.info["kind"] == "json":
             mask = rasterize_labelme(lp, self.info["label2idx"], img.shape[:2])
         else:
             mask = mask_to_index(read_mask(lp), self.info)
-        return resize_image(img, self.hw), resize_image(mask, self.hw, is_mask=True)
+        # 步骤 3：缩放到模型输入尺寸（与推理端同一套插值规则）；mask 用最近邻，不产生新类别
+        return resize(img, self.spec.img_size), resize_image(mask, self.hw, is_mask=True)
 
     def get_raw(self, i):
         """返回已缩放到目标尺寸的 (uint8 图像, 类别索引 mask)，用于可视化。"""
@@ -610,7 +614,7 @@ class SegDataset(Dataset):
         """返回**原分辨率**的 (uint8 图像, 类别索引 mask)：给训练结束后的可视化用，
         与 predict.py 一样先把预测放大回原图尺寸再叠加，保证与原图完全对齐。"""
         ip, lp = self.pairs[i]
-        img = load_image(ip, self.in_channels)
+        img = load_model_image(ip, self.in_channels)
         if self.info["kind"] == "json":
             mask = rasterize_labelme(lp, self.info["label2idx"], img.shape[:2])
         else:
@@ -623,10 +627,10 @@ class SegDataset(Dataset):
         return len(self.pairs)
 
     def __getitem__(self, i):
-        img, mask = self.get_raw(i)
-        if self.aug:
+        img, mask = self.get_raw(i)                 # 步骤 1~3 的结果（模型色彩 + 模型输入尺寸）
+        if self.aug:                                # 数据增强插在 resize 与 normalize 之间
             img, mask = augment(img, mask, self.aug)
-        x = normalize(img, self.mean, self.std)
+        x = to_blob(normalize(img, self.spec))[0]   # 步骤 4+5 -> CxHxW float32
         return torch.from_numpy(x), torch.from_numpy(np.ascontiguousarray(mask).astype(np.int64))
 
 

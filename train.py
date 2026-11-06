@@ -28,21 +28,22 @@ import segmentation_models_pytorch as smp
 from dataset import INFO_FILE, build_datasets
 from models import benchmark_ms, build_model, count_gflops, model_desc, run_name, sota_spec
 from sota import sota_info
-from utils import (abspath, imwrite_unicode, normalize, parse_args, plot_training_curves,
-                   render_prediction, resize_image, seg_metrics, to_hw)
+from inference.preprocess import PreprocessSpec, argmax_mask, normalize, resize, to_blob
+from utils import (abspath, imwrite_unicode, parse_args, plot_training_curves, render_prediction,
+                   seg_metrics, to_hw)
 
 # ============================ 所有参数集中在这里 ============================
 DEFAULTS = {
     # ---- 数据 ----
     "data_root": "data",              # 数据根目录（相对框架目录，也可写绝对路径如 E:/xxx/data）
-    "dataset": "lens_dataset",                # 数据集文件夹名：<data_root>/<dataset>/{train_dataset,labels}
+    "dataset": "inner_circle_dataset",                # 数据集文件夹名：<data_root>/<dataset>/{train_dataset,labels}
     "images_subdir": "train_dataset",
     "labels_subdir": "labels",
     "json_merge_labels": False,       # labelme 里出现多个 label 名时，True=全部并成同一前景类
     "mask_mode": "auto",              # mask 标签编码：auto / index(单通道索引图) / channels(每通道=1类，AIDK 风格)
     "class_names": [],                # 可选类名（含背景也行）；空=自动读 <dataset>/classes.txt，没有则用默认名
-    "img_size": [224, 224],           # [H, W]，需为 32 的倍数。AIDK 常用 288,512；labelme 数据用 224,224 或 64,64
-    "in_channels": 3,                 # 1=灰度，3=RGB
+    "img_size": [128, 128],           # [H, W]，需为 32 的倍数。AIDK 常用 288,512；labelme 数据用 224,224 或 64,64
+    "in_channels": 1,                 # 1=灰度，3=RGB
     "num_classes": 0,                 # 含背景；0=自动（labelme 单类别 -> 2，AIDK 三通道 mask -> 4）
     "norm": "auto",                   # 输入归一化方式：
                                       #   auto     = 用预训练权重(encoder_weights!=none)时用 ImageNet 归一化，否则用下面的 mean/std
@@ -66,12 +67,12 @@ DEFAULTS = {
     "encoder": "resnet18",            # resnet18 / resnet34 / mobilenet_v2 / tu-xxx(timm 模型) ...
     # ---- SOTA 模型（sota/ 文件夹，如 LiteSeg）----
     # sota_model 非空 = 不使用上面的 arch / encoder，改用 sota/ 下的模型；可选名字见 sota/__init__.py
-    "sota_model": "transunet",                 # 例如 "liteseg"；空字符串 = 使用 smp 的 arch + encoder
+    "sota_model": "liteseg",                 # 例如 "liteseg"；空字符串 = 使用 smp 的 arch + encoder
     "sota_backbone": "resnet18",      # sota 模型的骨干（liteseg: resnet18/34/50/101/152 或 mobilenet_v2）
     "sota_act": "relu",               # sota 模型的激活函数（relu / leakyrelu / silu / hardswish ...）
     "encoder_weights": "imagenet",    # imagenet 或 none（下载失败会自动退回 none 并提示）
     # ---- 训练 ----
-    "epochs": 10,
+    "epochs": 100,
     "batch_size": 8,
     "lr": 1e-3,                       # 解码器/分割头学习率（编码器随机初始化时，编码器也用这个）
     "encoder_lr_mult": 0.1,           # 预训练编码器学习率 = lr * 该值（0.1 -> 1e-4）；1.0=不区分。
@@ -284,10 +285,12 @@ def save_vis(model, ds, meta, out_dir, device, n, alpha=0.45):
     out_dir.mkdir(parents=True, exist_ok=True)
     model.eval()
     names = meta.get("class_names")
+    spec = PreprocessSpec.from_meta(meta)        # 与推理端同一份预处理规格
     for i in np.linspace(0, len(ds) - 1, min(n, len(ds))).astype(int):
-        raw, mask = ds.get_full(int(i))          # 原分辨率的图与 GT
-        x = torch.from_numpy(normalize(resize_image(raw, ds.hw), meta["mean"], meta["std"]))[None].to(device)
-        pred = model(x).argmax(1)[0].cpu().numpy().astype(np.uint8)
+        raw, mask = ds.get_full(int(i))          # 原分辨率的图（已是模型色彩）与 GT
+        # 步骤 3~5：resize -> (x-mean)/std -> NCHW（ds.get_full 已做完步骤 1+2，这里不再重复转色彩）
+        x = torch.from_numpy(to_blob(normalize(resize(raw, spec.img_size), spec))).to(device)
+        pred = argmax_mask(model(x).cpu().numpy())
         # 和 predict.py 一致：预测放大回原图尺寸（最近邻，不产生新类别）
         full = cv2.resize(pred, (raw.shape[1], raw.shape[0]), interpolation=cv2.INTER_NEAREST)
         vis = render_prediction(raw, full, alpha=alpha, class_names=names, edge_mask=mask)

@@ -6,7 +6,7 @@
 - **固定划分**：train / val / test 一次生成。训练只看 val，test 留给最终评估
 - **自动识别标签**：labelme `.json`、单通道索引 png、多通道 one-hot png
 - **可视化**：预测图一张看完原图、分割结果和真值轮廓；训练自动生成曲线图
-- **可部署**：导出 ONNX（与 PyTorch 输出校验一致），在 Linux 下转 RKNN
+- **可部署**：归一化在模型外部完成（ONNX 不含归一化）；预处理实现在 `inference/`，与 C++ 逐行对应并附 golden 向量对拍
 
 ## 快速开始
 
@@ -78,10 +78,13 @@ python predict.py                                    # 在 test 段做最终评�
 ### 6. 导出部署
 
 ```bash
-python export_onnx.py                   # best.pth → model.onnx
+python export_onnx.py                   # best.pth → model.onnx（+ model_meta.json，含预处理规格）
 python predict.py --backend onnx        # 用 ONNX 再评估一遍，确认前后处理一致
-python convert_rknn.py                  # 仅 Linux / WSL2，需要 rknn-toolkit2
+python inference/preprocess.py          # 预处理自检 + 生成 golden 向量（给 C++ 对拍）
 ```
+
+ONNX 的输入是**已经归一化**的 `1xCxHxW float32`，C++ 侧照
+[docs/preprocess.md](docs/preprocess.md) 的五个步骤实现即可（每步都有对应的 OpenCV 调用）。
 
 ## 目录约定
 
@@ -94,6 +97,7 @@ python convert_rknn.py                  # 仅 Linux / WSL2，需要 rknn-toolkit
 | `data/<数据集名>/classes.txt` | 可选，类别名，每行一个 |
 | `runs/<数据集名>/<arch>_<encoder>_<H>x<W>/` | 训练输出：权重、日志、曲线、可视化（SOTA 模型为 `<sota_model>_<backbone>_<H>x<W>`，骨干为空时如 `transunet_224x224`） |
 | `sota/` | 非 smp 的 SOTA 模型（LiteSeg、TransUNet），每个模型一个子目录 |
+| `inference/` | 统一预处理（纯 numpy+cv2，与 C++ 逐行对应），训练与推理共用 |
 
 ## 脚本一览
 
@@ -107,7 +111,6 @@ python convert_rknn.py                  # 仅 Linux / WSL2，需要 rknn-toolkit
 | `sweep.py` | 批量训练 架构 × 编码器，输出排行榜与帕累托 |
 | `predict.py` | 预测；有标签时计算指标；默认在 test 段评估 |
 | `export_onnx.py` | 导出 ONNX 并校验 |
-| `convert_rknn.py` | 转换 RKNN（仅 Linux） |
 
 每个脚本的参数都集中在文件顶部的 `DEFAULTS` 字典里（`dataset.py` 为 `PREP_DEFAULTS`）。可以直接改默认值，也可以在命令行覆盖：
 
@@ -125,6 +128,7 @@ python train.py --acc_exclude_bg false            # 布尔参数传 true / false
 | [docs/outputs.md](docs/outputs.md) | 训练输出、日志字段、指标与曲线图说明 |
 | [docs/predict.md](docs/predict.md) | 预测输入模式、可视化约定、最终评估 |
 | [docs/sota.md](docs/sota.md) | SOTA 模型（LiteSeg / TransUNet）的用法、迁移说明、如何新增模型 |
+| [docs/preprocess.md](docs/preprocess.md) | 统一预处理接口、C++ 对应关系、golden 向量对拍 |
 
 ## 常见问题
 

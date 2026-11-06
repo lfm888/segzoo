@@ -17,6 +17,9 @@ data/*
 !data/_demo_labelme/
 !data/README.md
 
+# 预处理 golden 向量（自检时生成）
+inference/golden/
+
 # 模型权重（体积大）
 *.pth
 *.pt
