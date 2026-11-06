@@ -19,7 +19,7 @@ from utils import abspath, parse_args, to_hw
 DEFAULTS = {
     "archs": list(RKNN_FRIENDLY_ARCHS),        # 例如 ["unet","fpn","linknet","pan"]
     "encoders": list(RKNN_FRIENDLY_ENCODERS),  # 例如 ["mobilenet_v2","resnet18","resnet34"]
-    "epochs": 30,                 # 筛选用的小预算；选出前几名后再用 train.py 加大 epochs 精训
+    "epochs": 3,                 # 筛选用的小预算；选出前几名后再用 train.py 加大 epochs 精训
     "skip_done": True,            # 已有 results.json 的组合直接复用，中断后可续跑
     # 下面几项默认直接取自 train.py 的 DEFAULTS（单一来源），需要时在命令行覆盖
     "dataset": TRAIN_DEFAULTS["dataset"],

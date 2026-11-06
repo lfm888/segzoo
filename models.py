@@ -8,8 +8,8 @@ from sota import build_sota, sota_info
 
 # 对 RKNN 比较友好的候选（纯卷积为主）。sweep.py 的 DEFAULTS 会引用，可自行增删。
 # smp 支持的其它架构：unetplusplus, manet, deeplabv3, deeplabv3plus, pspnet, upernet, segformer, dpt ...
-RKNN_FRIENDLY_ARCHS = ["unet", "fpn", "linknet", "pan"]
-RKNN_FRIENDLY_ENCODERS = ["mobilenet_v2", "resnet18", "resnet34"]
+RKNN_FRIENDLY_ARCHS = ["unet", "fpn", "linknet", "unetplusplus","deeplabv3plus"]
+RKNN_FRIENDLY_ENCODERS = ["timm-mobilenetv3_small_minimal_100", "resnet18", "resnet34", "efficientnet-b0", "resnext50_32x4d", "mit_b0"] #mit仅支持三通道
 
 
 def sota_spec(cfg, hw=None):

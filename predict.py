@@ -42,7 +42,7 @@ DEFAULTS = {
     "ckpt": "latest",        # latest = runs 下最新的 best.pth
     "runs_dir": "runs",
     # ---- 推理后端 ----
-    "backend": "dnn",      # torch / onnx(onnxruntime) / dnn(OpenCV DNN)
+    "backend": "torch",      # torch / onnx(onnxruntime) / dnn(OpenCV DNN)
     "onnx": "",              # 空 = 与 ckpt 同目录的 model.onnx；也可直接给 .onnx 路径
                              #      （同目录有 model_meta.json 时不需要 ckpt，用来单独验证导出的 ONNX）
     # ---- 输入 ----
