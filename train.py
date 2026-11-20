@@ -2,13 +2,19 @@
 
 直接运行：python train.py
 覆盖参数：python train.py --arch fpn --encoder mobilenet_v2 --epochs 50 --img_size 224,224
+选归一化：python train.py --norm imagenet     （默认）
+          python train.py --norm 01           （mean=0, std=1，只做 x/255）
 
-本版新增（针对“前几轮验证 loss 异常偏高、验证指标抖动”）：
-  1) 逐步线性 warmup + 逐步余弦退火（warmup_epochs / warmup_start_factor / min_lr_factor）
-  2) 预训练编码器与解码器分层学习率（encoder_lr_mult）
-  3) 归一化统一用 ImageNet（灰度取三通道均值近似），meta 里记录实际 mean/std，
-     predict / export_onnx / convert_rknn 读 meta，自动保持一致
-  4) 可选早停（early_stop_patience，默认关闭）
+预处理（本版重点）：
+  * 归一化方案由 DEFAULTS["norm"] 选择（imagenet / 01），run() 里用 PreprocessSpec.from_config(cfg) 构造唯一的一份规格；
+  * 像素范围检查 + /255 + (x-mean)/std 全部在 inference/preprocess.py 的 normalize() 里完成，mean/std 一律是 0~1 量纲；
+  * 训练端可视化显式调用 preprocess(...)，数据集也应通过 cfg["spec"] 调 normalize(...)；
+  * 训练开始前用 check_preprocess_consistency 校验三层：数据集输出 vs 部署用 preprocess()、
+    增强后 float32(0~255) 路径 vs uint8 路径、训练样本数值范围是否在 blob 理论范围内，
+    任何一项不一致就直接报错，避免训练/部署的量纲或系数悄悄不同导致精度丢失；
+  * 实际使用的 mean/std/norm/norm_units 写进 meta，predict / export_onnx / convert_rknn 读 meta 保持一致。
+
+其余能力：逐步线性 warmup + 逐步余弦退火、预训练编码器分层学习率、可选早停。
 """
 import csv
 import json
@@ -28,7 +34,7 @@ import segmentation_models_pytorch as smp
 from dataset import INFO_FILE, build_datasets
 from models import benchmark_ms, build_model, count_gflops, model_desc, run_name, sota_spec
 from sota import sota_info
-from inference.preprocess import PreprocessSpec, argmax_mask, imagenet_norm, normalize, resize, to_blob
+from inference.preprocess import NORM_CHOICES, PreprocessSpec, argmax_mask, normalize, preprocess, resize, to_blob
 from utils import (Progress, abspath, fmt_secs, imwrite_unicode, parse_args, plot_training_curves,
                    print_model_complexity, render_prediction, seg_metrics, to_hw)
 
@@ -42,12 +48,17 @@ DEFAULTS = {
     "json_merge_labels": False,       # labelme 里出现多个 label 名时，True=全部并成同一前景类
     "mask_mode": "auto",              # mask 标签编码：auto / index(单通道索引图) / channels(每通道=1类，AIDK 风格)
     "class_names": [],                # 可选类名（含背景也行）；空=自动读 <dataset>/classes.txt，没有则用默认名
-    "img_size": [128, 128],           # [H, W]，需为 32 的倍数。AIDK 常用 288,512；labelme 数据用 224,224 或 64,64
+    "img_size": [64, 64],           # [H, W]，需为 32 的倍数。AIDK 常用 288,512；labelme 数据用 224,224 或 64,64
     "in_channels": 1,                 # 1=灰度，3=RGB
     "num_classes": 0,                 # 含背景；0=自动（labelme 单类别 -> 2，AIDK 三通道 mask -> 4）
-    # 输入归一化固定为 ImageNet（不是命令行参数，norm/mean/std 已移除）：
-    #   3 通道 mean=[123.675,116.28,103.53] std=[58.395,57.12,57.375]；灰度: 取三通道均值作近似
-    #   (x-mean)/std，0~255 单位；实际使用的值由 resolve_norm 算出并写进 meta（RKNN 转换会读 meta）
+    # ---- 输入归一化（二选一，默认 imagenet）----
+    #   imagenet : 像素先 /255 到 [0,1]，再 (x-mean)/std，mean=[0.485,0.456,0.406] std=[0.229,0.224,0.225]（RGB）；
+    #              灰度取三通道均值作近似。预训练编码器强烈建议用它
+    #   01       : mean=0, std=1，即只做 x/255，输入范围 [0,1]
+    #   mean/std 一律是 0~1 量纲；0~255 量纲只在 RKNN config 处通过 spec.mean_255()/std_255() 换算。
+    #   实际使用的值由 inference.preprocess 算出并写进 meta（predict / export_onnx / convert_rknn 会读 meta）
+    "norm": "imagenet",               # imagenet / 01
+    "check_preprocess": True,         # 训练前校验：数据集输出 vs preprocess()、float/uint8 两条路径、数值范围（不一致直接报错，建议保持 True）
     "val_ratio": 0.1,                 # 仅用于首次生成 split.txt：验证集占比
     "test_ratio": 0.1,                # 仅用于首次生成 split.txt：测试集占比（train.py 不碰 test，留给 predict.py 评估）
     "split_file": "split.txt",        # 固定划分文件（相对数据集目录）；空字符串=不落盘
@@ -63,8 +74,8 @@ DEFAULTS = {
     "encoder": "resnet18",            # resnet18 / resnet34 / mobilenet_v2 / tu-xxx(timm 模型) ...
     # ---- SOTA 模型（sota/ 文件夹，如 LiteSeg）----
     # sota_model 非空 = 不使用上面的 arch / encoder，改用 sota/ 下的模型；可选名字见 sota/__init__.py
-    "sota_model": "yolo11",                 # 例如 "liteseg"；空字符串 = 使用 smp 的 arch + encoder
-    "sota_backbone": "s",      # sota 模型的骨干（liteseg: resnet18/34/50/101/152 或 mobilenet_v2）
+    "sota_model": "liteseg",                 # 例如 "liteseg"；空字符串 = 使用 smp 的 arch + encoder
+    "sota_backbone": "resnet18",      # sota 模型的骨干（liteseg: resnet18/34/50/101/152 或 mobilenet_v2）
     "sota_act": "silu",               # sota 模型的激活函数（relu / leakyrelu / silu / hardswish ...）
     "encoder_weights": "imagenet",    # imagenet 或 none（下载失败会自动退回 none 并提示）
     # ---- 训练 ----
@@ -113,8 +124,8 @@ DEFAULTS = {
 }
 # ===========================================================================
 
-# ImageNet 统计量定义在 inference/preprocess.py（IMAGENET_MEAN / IMAGENET_STD / imagenet_norm），
-# 训练端、推理端、C++ 只有这一份，这里只负责按通道数取用并写进 meta。
+# 归一化的定义（ImageNet 统计量、01 方案、0~255 -> 0~1 量纲统一、像素范围检查）全部在 inference/preprocess.py，
+# 训练端、推理端、C++ 只有这一份；这里只负责：按 cfg["norm"] 构造 spec、显式调用 preprocess、把 spec 写进 meta。
 
 
 def set_seed(s):
@@ -124,23 +135,75 @@ def set_seed(s):
     torch.cuda.manual_seed_all(s)
 
 
-def resolve_norm(cfg):
-    """归一化统一用 ImageNet，返回 (mean, std, 说明文字)；实际值写进 meta 供 predict/export/rknn 读取。
-    预训练编码器是在 ImageNet 归一化的输入上训练的，输入分布差太多会让前几轮的 BN 统计量/特征严重错位；
-    灰度输入取三通道均值/标准差作近似（与 smp 把预训练 conv1 的三通道权重求和一致）。"""
-    c = int(cfg["in_channels"])
-    mean, std = imagenet_norm(c)
-    return mean, std, "imagenet" if c == 3 else "imagenet(灰度近似)"
+def check_preprocess_consistency(val_ds, spec, train_ds=None, atol=1e-4):
+    """训练前的一致性校验（三个层次，任何一项不过就直接报错，不让模型带病训完）：
 
+    1) 数据集 vs 部署：验证集第 0 张（训练实际喂给网络的张量）
+       vs 同一张原图显式调用 preprocess(raw, spec, model_color=True)。
+       不一致 = 训练管线的量纲 / 系数 / 缩放规则与部署不同，训出来部署会掉精度。
+    2) uint8 路径 vs float(0~255) 路径：数据增强输出的是 float32、0~255，
+       必须与 uint8 走同一条归一化（即 /255 只做一次）。
+    3) 形状与数值范围：数据集的通道/尺寸要与 spec 一致；开启增强后第 0 个训练样本的
+       数值必须落在 blob 的理论范围 [(0-mean)/std, (1-mean)/std] 内（能抓到“忘了 /255”或“归一化了两次”）。
+       若 blob 几乎为常数则给出警告（双方“错得一样”时只有这个信号能看出来）。
 
-def make_lr_lambda(total, warm, start, min_f):
-    """逐步（按 iteration）的学习率系数：线性 warmup(start->1) 之后接余弦退火(1->min_f)。"""
-    def f(step):
-        if warm > 0 and step < warm:
-            return start + (1.0 - start) * step / warm
-        p = min(1.0, max(0.0, (step - warm) / max(1, total - warm)))
-        return min_f + (1.0 - min_f) * 0.5 * (1.0 + math.cos(math.pi * p))
-    return f
+    返回第 1 项的最大绝对差；数据集没有 get_full / 为空时跳过并返回 None。"""
+    if not hasattr(val_ds, "get_full"):
+        print("[预处理一致性] 数据集没有 get_full()，跳过校验")
+        return None
+    if len(val_ds) == 0:
+        print("[预处理一致性] 验证集为空，跳过校验")
+        return None
+
+    # ---- 1) 数据集输出 vs preprocess() ----
+    x_ds = val_ds[0][0]
+    x_ds = x_ds.detach().cpu().numpy() if hasattr(x_ds, "detach") else np.asarray(x_ds)
+    raw, _ = val_ds.get_full(0)                               # 原分辨率、已是模型色彩（RGB/灰度）的 uint8 图
+    x_ref = preprocess(raw, spec, model_color=True)[0]        # 部署用的完整预处理：转色 -> 缩放 -> /255 -> (x-mean)/std -> CHW
+    if x_ds.shape != x_ref.shape:
+        raise RuntimeError("[预处理一致性] 形状不一致：数据集 %s vs preprocess() %s（通道数/缩放尺寸不同）"
+                           % (tuple(x_ds.shape), tuple(x_ref.shape)))
+    diff = float(np.abs(x_ds.astype(np.float32) - x_ref).max())
+    if diff > atol:
+        raise RuntimeError(
+            "[预处理一致性] 数据集输出与 preprocess() 的最大绝对差 %.3e > %.0e。\n"
+            "  训练端的归一化量纲/系数/缩放规则与部署不一致。请让 dataset.py 的归一化改为\n"
+            "      from inference.preprocess import normalize\n"
+            "      x = normalize(img, cfg['spec'])        # img 为缩放后（可增强）的 uint8 或 0~255 float 图\n"
+            "  不要再自己手写 (x-mean)/std。" % (diff, atol))
+    print("[预处理一致性] 数据集输出 vs preprocess()：最大绝对差 %.2e -> 一致" % diff)
+    # 软检查：两者可能“错得一样”（例如都用了 0~255 量纲的 mean），此时逐元素相等也抦不住。
+    # 那种情况归一化后的图会趋于常数（(x/255-123.675)/58.395），这里用范围变小来提醒。
+    rng = float(x_ref.max() - x_ref.min())
+    if rng < 0.05:
+        print("[预处理一致性] 警告：预处理后的 blob 数值范围只有 %.3f（几乎为常数），"
+              "请检查 mean/std 量纲（应为 0~1）或图像是否全黑/全白" % rng)
+
+    # ---- 2) 增强后的 float32(0~255) 路径 == uint8 路径 ----
+    img_u8, _ = val_ds.get_raw(0)
+    x_float = to_blob(normalize(resize(img_u8.astype(np.float32), spec.img_size), spec))[0]
+    d2 = float(np.abs(x_float - x_ref).max())
+    if d2 > atol:
+        raise RuntimeError(
+            "[预处理一致性] float32(0~255，增强后的量纲) 路径与 uint8 路径的最大绝对差 %.3e > %.0e。\n"
+            "  normalize() 的 float 分支应有且只有一次 /255，且增强不能自行归一化。" % (d2, atol))
+    print("[预处理一致性] 增强 float32(0~255) 路径 vs uint8 路径：最大绝对差 %.2e -> 一致" % d2)
+
+    # ---- 3) 增强后训练样本的数值范围 ----
+    if train_ds is not None and len(train_ds) > 0:
+        x_tr = train_ds[0][0]
+        x_tr = x_tr.detach().cpu().numpy() if hasattr(x_tr, "detach") else np.asarray(x_tr)
+        lo = min((0.0 - m) / s for m, s in zip(spec.mean, spec.std))
+        hi = max((1.0 - m) / s for m, s in zip(spec.mean, spec.std))
+        tol = 1e-3
+        if x_tr.min() < lo - tol or x_tr.max() > hi + tol:
+            raise RuntimeError(
+                "[预处理一致性] 训练样本数值范围 [%.3f, %.3f] 超出 blob 理论范围 [%.3f, %.3f]（norm=%s）。\n"
+                "  常见原因：忘了 /255（值约 0~255）、归一化了两次、或 mean/std 量纲不对。"
+                % (float(x_tr.min()), float(x_tr.max()), lo, hi, spec.norm))
+        print("[预处理一致性] 训练样本范围 [%.3f, %.3f] 在理论范围 [%.3f, %.3f] 内"
+              % (float(x_tr.min()), float(x_tr.max()), lo, hi))
+    return diff
 
 
 def build_optimizer(model, cfg, pretrained):
@@ -159,6 +222,16 @@ def build_optimizer(model, cfg, pretrained):
     else:
         txt = "AdamW  lr=%g  wd=%g" % (lr, cfg["weight_decay"])
     return opt, txt
+
+
+def make_lr_lambda(total, warm, start, min_f):
+    """逐步（按 iteration）的学习率系数：线性 warmup(start->1) 之后接余弦退火(1->min_f)。"""
+    def f(step):
+        if warm > 0 and step < warm:
+            return start + (1.0 - start) * step / warm
+        p = min(1.0, max(0.0, (step - warm) / max(1, total - warm)))
+        return min_f + (1.0 - min_f) * 0.5 * (1.0 + math.cos(math.pi * p))
+    return f
 
 
 class Criterion(nn.Module):
@@ -217,19 +290,20 @@ def _clean(v):
 
 
 @torch.no_grad()
-def save_vis(model, ds, meta, out_dir, device, n, alpha=0.45):
+def save_vis(model, ds, spec, meta, out_dir, device, n, alpha=0.45):
     """验证集可视化，一张图对比 GT 与预测，尺寸与 predict.py 一致（都是原图分辨率）：
-      虚线边界 = 真值 mask（同色）；半透明色块 = 预测结果（放大回原图尺寸）；底图 = 原图。"""
+      虚线边界 = 真值 mask（同色）；半透明色块 = 预测结果（放大回原图尺寸）；底图 = 原图。
+    预处理显式调用 preprocess()，与推理/部署完全同一条路径。"""
     if n <= 0:
         return
     out_dir.mkdir(parents=True, exist_ok=True)
     model.eval()
     names = meta.get("class_names")
-    spec = PreprocessSpec.from_meta(meta)        # 与推理端同一份预处理规格
     for i in np.linspace(0, len(ds) - 1, min(n, len(ds))).astype(int):
-        raw, mask = ds.get_full(int(i))          # 原分辨率的图（已是模型色彩）与 GT
-        # 步骤 3~5：resize -> (x-mean)/std -> NCHW（ds.get_full 已做完步骤 1+2，这里不再重复转色彩）
-        x = torch.from_numpy(to_blob(normalize(resize(raw, spec.img_size), spec))).to(device)
+        raw, mask = ds.get_full(int(i))          # 原分辨率的图（已是模型色彩 RGB/灰度 uint8）与 GT
+        # 显式调用统一预处理：缩放 -> 像素范围检查并 /255 -> (x-mean)/std -> NCHW
+        # model_color=True：raw 已是模型色彩，跳过 BGR->RGB，避免二次转换
+        x = torch.from_numpy(preprocess(raw, spec, model_color=True)).to(device)
         pred = argmax_mask(model(x).cpu().numpy())
         # 和 predict.py 一致：预测放大回原图尺寸（最近邻，不产生新类别）
         full = cv2.resize(pred, (raw.shape[1], raw.shape[0]), interpolation=cv2.INTER_NEAREST)
@@ -257,9 +331,10 @@ def _section(title):
 
 
 def print_summary(cfg, info, train_ds, val_ds, train_loader, model, C, hw, device, amp, run_dir,
-                  norm_txt="", extra_train_lines=()):
+                  spec, extra_train_lines=()):
     """训练开始前打印：数据集 / 模型(参数量、计算量) / 训练配置 / 输出目录。
     返回 (参数量 M, GFLOPs)，训练结束写 results.json 时直接复用，不再重复统计。
+    spec: PreprocessSpec，用来打印实际生效的归一化。
     extra_train_lines: 追加到“训练配置”里的 (键, 值) 行（优化器/学习率策略/早停等）。"""
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -301,8 +376,9 @@ def print_summary(cfg, info, train_ds, val_ds, train_loader, model, C, hw, devic
     _kv(lines, "标签扫描", "复用缓存 %s" % info["from_cache"] if info.get("from_cache")
         else "本次重新扫描（已缓存到 %s）" % INFO_FILE)
     _kv(lines, "输入", "%d 通道 @ %dx%d" % (cfg["in_channels"], hw[0], hw[1]))
-    _kv(lines, "归一化", "%s   mean=%s  std=%s" % (
-        norm_txt or "imagenet", [round(v, 3) for v in cfg["mean"]], [round(v, 3) for v in cfg["std"]]))
+    _kv(lines, "归一化", "%s   像素 /255 -> [0,1] 后 (x-mean)/std" % spec.norm)
+    _kv(lines, "  mean/std(0~1)", "mean=%s  std=%s" % (
+        [round(v, 4) for v in spec.mean], [round(v, 4) for v in spec.std]))
     print("\n".join(lines))
 
     _section("2/4 模型")
@@ -363,7 +439,7 @@ def print_epoch(ep, n_ep, tm, vm, names, lr, t_train, t_val, elapsed, eta, is_be
 
 def run(cfg):
     """训练一个模型并返回结果 dict（sweep.py 也会调用它）。"""
-    cfg = dict(cfg)                       # 下面会写入实际使用的 mean/std，不改调用方的字典
+    cfg = dict(cfg)                       # 下面会写入 spec 等，不改调用方的字典
     # sota 模型：下游的命名 / 打印 / meta / 结果文件统一读 arch、encoder 两个字段，这里把它们换成 sota 的名字
     sota = sota_spec(cfg, to_hw(cfg["img_size"]))   # 同时检查骨干与输入尺寸（如 TransUNet 要正方形）
     if sota:
@@ -381,10 +457,18 @@ def run(cfg):
     if hw[0] % 32 or hw[1] % 32:
         raise ValueError("img_size 必须是 32 的倍数，当前 %s" % (hw,))
 
-    # 归一化必须在建数据集之前决定（数据集用 cfg["mean"]/cfg["std"]），并写进 meta 供 predict/export/rknn 使用
-    cfg["mean"], cfg["std"], norm_txt = resolve_norm(cfg)
+    # ---- 预处理规格：整个训练/验证/可视化/部署共用的唯一一份 ----
+    # 必须在建数据集之前构造。norm 不合法（不是 imagenet / 01）会在这里直接报错。
+    if str(cfg.get("norm", "imagenet")).strip().lower() not in NORM_CHOICES:
+        raise ValueError("norm 只能是 %s 之一，当前 %r" % (" / ".join(NORM_CHOICES), cfg.get("norm")))
+    spec = PreprocessSpec.from_config({**cfg, "img_size": [hw[0], hw[1]]})
+    cfg["spec"] = spec                    # build_datasets 读它：数据集里的归一化统一走 inference.preprocess.normalize(img, spec)
 
     train_ds, val_ds, info = build_datasets(cfg)
+    if cfg.get("check_preprocess", True):
+        # 训练数据管线 == 部署预处理，不一致直接报错（含增强 float32(0~255) 路径与数值范围检查）
+        check_preprocess_consistency(val_ds, spec, train_ds)
+
     C = cfg["num_classes"] or info["num_classes"]
     name = run_name(cfg["arch"], cfg["encoder"], hw[0], hw[1])
     run_dir = abspath(cfg["runs_dir"]) / cfg["dataset"] / name
@@ -399,7 +483,10 @@ def run(cfg):
     meta = {  # 只放基础类型，保证 torch.load 在新版本下也安全
         "arch": cfg["arch"], "encoder": cfg["encoder"], "sota": sota, "in_channels": int(cfg["in_channels"]),
         "num_classes": int(C), "img_size": [hw[0], hw[1]],
-        "mean": [float(v) for v in cfg["mean"]], "std": [float(v) for v in cfg["std"]], "norm": norm_txt,
+        # 归一化：mean/std 为 0~1 量纲（像素先 /255）。norm_units 是量纲标记，PreprocessSpec.from_meta 靠它区分新旧 meta；
+        # 需要 0~255 量纲（RKNN config）时用 spec.mean_255()/std_255() 换算，不要手写
+        "norm": spec.norm, "norm_units": "0-1",
+        "mean": [float(v) for v in spec.mean], "std": [float(v) for v in spec.std],
         "dataset": cfg["dataset"], "data_root": str(cfg["data_root"]), "images_subdir": cfg["images_subdir"],
         "labels_subdir": cfg["labels_subdir"], "json_merge_labels": bool(cfg["json_merge_labels"]),
         "kind": info["kind"], "mask_mode": info.get("mask_mode"),
@@ -442,7 +529,7 @@ def run(cfg):
     if cfg.get("complexity"):
         print_model_complexity(model, int(cfg["in_channels"]), hw, device)
     params_m, gflops = print_summary(cfg, info, train_ds, val_ds, train_loader, model, C, hw, device, amp, run_dir,
-                                     norm_txt=norm_txt, extra_train_lines=extra_train_lines)
+                                     spec=spec, extra_train_lines=extra_train_lines)
 
     best, best_epoch, best_metrics = -1.0, 0, None
     es_best, es_bad, stopped_at, epochs_run = -1.0, 0, None, 0
@@ -519,13 +606,13 @@ def run(cfg):
     # 用最佳权重做可视化与效率统计
     ck = torch.load(str(run_dir / "best.pth"), map_location="cpu")
     model.load_state_dict(ck["model"])
-    save_vis(model, val_ds, meta, run_dir / "vis", device, int(cfg["vis_samples"]),
+    save_vis(model, val_ds, spec, meta, run_dir / "vis", device, int(cfg["vis_samples"]),
              alpha=float(cfg.get("vis_alpha", 0.45)))
     shape = (1, int(cfg["in_channels"]), hw[0], hw[1])
     results = {
         "name": name, "arch": cfg["arch"], "encoder": cfg["encoder"], "img_size": [hw[0], hw[1]],
         "num_classes": C, "epochs": cfg["epochs"], "epochs_run": epochs_run,
-        "early_stopped": stopped_at is not None, "norm": norm_txt, "best_epoch": best_epoch,
+        "early_stopped": stopped_at is not None, "norm": spec.norm, "best_epoch": best_epoch,
         "mdice": _clean(best_metrics["mdice"]), "miou": _clean(best_metrics["miou"]),
         "mprec": _clean(best_metrics["mprec"]), "mrec": _clean(best_metrics["mrec"]),
         "mf1": _clean(best_metrics["mf1"]), "pacc": _clean(best_metrics["pacc"]),

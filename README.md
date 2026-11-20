@@ -78,9 +78,26 @@ python train.py --arch unet --encoder resnet18 --epochs 50 --batch_size 8
 | `--sota_model` | `"liteseg"` | 启用 SOTA 模型（如 `yolo11`、`transunet`、`liteseg`），留空则使用 SMP 模型 | 
 | `--sota_backbone` | `"resnet18"` | SOTA 模型骨干或档位（如 YOLO11 的 `n`/`s`/`m`/`l`/`x`） | 
 | `--encoder_weights` | `"imagenet"` | 预训练权重（`imagenet`、`none` 或指定 `.pt`/`.pth` 文件路径） | 
+| `--norm` | `"imagenet"` | 归一化方案：`imagenet`（mean/std 为 0~1 量纲）或 `01`（只做 `x/255`，适合上游不归一化的 SOTA 模型） | 
 | `--epochs` | `20` | 训练总轮数 | 
 | `--batch_size` | `8` | 批次大小 | 
 | `--lr` | `1e-3` | 学习率 | 
+
+## 🧪 预处理与归一化约定
+
+训练、PyTorch/ONNX 推理、C++ 部署共用 `inference/preprocess.py` 里的**一份**实现（归一化在模型外部，ONNX 不含）。
+
+* **一个入口**：`normalize(img, spec)` = 像素范围检查 → `/255` → `(x - mean) / std`。训练、验证、可视化、导出、推理全部走它。
+* **一种量纲**：`mean` / `std` 一律是 **0~1**（ImageNet 即 `0.485/0.229`）。`PreprocessSpec` 有量纲守卫，
+  传 0~255 的值会直接报错；需要 0~255 的下游（RKNN config）用 `spec.mean_255()` / `spec.std_255()`。
+* **一份校验**：`train.py` 会在训练开始前用 `check_preprocess_consistency()` 把“数据集喂给网络的张量”与
+  “同一张图经 `preprocess()` 的结果”逐元素对一遍，不一致直接报错。
+* **meta 标记**：`norm` / `norm_units="0-1"` / `mean` / `std` 写进 `best.pth` 的 meta 与 `model_meta.json`，
+  `predict.py` / `export_onnx.py` 只读它，不再各写一份。
+
+接口变更：`SegDataset` 不再接收 `mean/std/img_size`（改收 `PreprocessSpec`，训练时由 `cfg["spec"]` 传入）；
+`PreprocessSpec` 不再接受 0~255 量纲的 `mean/std`。旧 checkpoint / 旧 `model_meta.json` 会被 `from_meta()`
+自动识别并 `/255` 换算（附一条警告），但要得到不带警告的完整口径建议用新版脚本重新训练 / 导出。
 
 ## 📊 训练产物
 

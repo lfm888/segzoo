@@ -124,10 +124,18 @@ def resize_image(img, hw, is_mask=False):
 
 
 def normalize(img, mean, std):
-    """(x - mean) / std，mean/std 以 0~255 为单位，返回 float32 的 CxHxW。
-    等价于 inference.preprocess.normalize(...).transpose(2,0,1)。"""
+    """旧接口：(x - mean) / std，返回 float32 的 CxHxW。**新代码请直接用
+    inference.preprocess.normalize(img, spec)（mean/std 一律 0~1 量纲），本函数只为兼容旧调用保留。**
+
+    mean/std 沿用旧习惯以 0~255 为单位（如 123.675 / 58.395）；内部自动识别量纲：
+    最大值 > 1 视为 0~255 并换算成 0~1，否则视为已经是 0~1。换算后调用推理端同一实现
+    （像素由 to_unit_range 统一 /255），数值等价，只差浮点舍入。"""
     x = img.astype(np.float32)
     c = 1 if x.ndim == 2 else x.shape[2]
+    mean = [float(v) for v in np.atleast_1d(np.asarray(mean, dtype=np.float64))]
+    std = [float(v) for v in np.atleast_1d(np.asarray(std, dtype=np.float64))]
+    if max(mean + std) > 1.0:                     # 0~255 量纲 -> 0~1 量纲（PreprocessSpec 只接受 0~1）
+        mean, std = [v / 255.0 for v in mean], [v / 255.0 for v in std]
     spec = pp.PreprocessSpec(c, (1, 1), mean, std)      # normalize 不用 img_size，占位即可
     return np.ascontiguousarray(pp.normalize(x, spec).transpose(2, 0, 1))
 

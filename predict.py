@@ -5,6 +5,12 @@
   onnx       onnxruntime（model.onnx）
   dnn        OpenCV DNN（cv::dnn::readNetFromONNX，与 C++ 部署同一套算子）
 
+预处理（本版说明）：
+  * 每张图都显式调用 preprocess(raw_bgr, spec)：转色 -> 缩放 -> 像素范围检查并 /255 -> (x-mean)/std -> NCHW；
+  * spec 由 meta（best.pth 内的 meta 或 model_meta.json）经 PreprocessSpec.from_meta 构造，mean/std 为 0~1 量纲；
+  * 旧版 meta（0~255 量纲）会被自动换算并警告，建议用新版 train.py / export_onnx.py 重新生成；
+  * 启动时会打印实际生效的归一化方案与 mean/std，--verbose 时再打印第一张图 blob 的数值范围，便于核对。
+
 `--input_dir` 支持三种情况（都能直接跑）：
   1) 留空            -> 用 ckpt 里记录的训练数据集，默认只跑它的 split.txt 的 test 段
   2) 同格式数据集目录 -> 形如 <dir>/train_dataset + <dir>/labels [+ <dir>/split.txt]
@@ -42,7 +48,7 @@ DEFAULTS = {
     "ckpt": "latest",        # latest = runs 下最新的 best.pth
     "runs_dir": "runs",
     # ---- 推理后端 ----
-    "backend": "dnn",      # torch / onnx(onnxruntime) / dnn(OpenCV DNN)
+    "backend": "onnx",      # torch / onnx(onnxruntime) / dnn(OpenCV DNN)
     "onnx": "",              # 空 = 与 ckpt 同目录的 model.onnx；也可直接给 .onnx 路径
                              #      （同目录有 model_meta.json 时不需要 ckpt，用来单独验证导出的 ONNX）
     # ---- 输入 ----
@@ -50,7 +56,7 @@ DEFAULTS = {
     "images_subdir": "",     # 指定 input_dir 下的图像子目录（空=自动找 train_dataset/images，否则用 input_dir 本身）
     "labels_subdir": "labels",   # 数据集目录里的标签子目录名
     "split": "test",         # test / val / train / all；该目录没有 split.txt 时自动按 all
-    "max_images": 0,         # 0 = 全部
+    "max_images": 20,         # 0 = 全部
     # ---- 输出 ----
     "out_dir": "",           # 空 = <ckpt 所在目录>/predict（指定了 input_dir 时是 predict_<目录名>）
     "device": "auto",        # auto / cuda / cpu（onnx / dnn 后端固定用 CPU）
@@ -271,7 +277,8 @@ def main():
     device = torch.device("cuda" if use_cuda else "cpu")
 
     meta, meta_src, ckpt, model, onnx_path = load_meta_and_model(cfg, backend, device)
-    spec = PreprocessSpec.from_meta(meta)        # 预处理规格：与训练 / ONNX / C++ 同一份契约
+    # 预处理规格：与训练 / ONNX / C++ 同一份契约（mean/std 为 0~1 量纲；旧 meta 会自动由 0~255 换算并警告）
+    spec = PreprocessSpec.from_meta(meta)
     hw = tuple(spec.img_size)
     C = int(meta["num_classes"])
     class_names = list(meta.get("class_names") or [])
@@ -296,6 +303,8 @@ def main():
 
     print("[predict] %s | backend=%s | 模型: %s" % (run_label, runner.name, model_file))
     print("[predict] 预处理规格来源: %s" % meta_src)
+    print("[predict] 归一化: %s  像素 /255 -> [0,1] 后 (x-mean)/std  mean=%s std=%s" % (
+        spec.norm, [round(v, 4) for v in spec.mean], [round(v, 4) for v in spec.std]))
     print("[predict] 输入 %s" % src["desc"])
     print("[predict] 图像目录 %s | %s | %d 张 -> %s" % (src["images"], files_desc, len(files), out_dir))
 
@@ -347,10 +356,11 @@ def main():
     t_pre = t_inf = t_post = 0.0
     prog = Progress(len(files), "predict", enabled=bool(cfg["progress_bar"]))
     for k, p in enumerate(files, 1):
-        # C++ 里的等价流程：cv::imread -> cvtColor -> resize -> (x-mean)/std -> blobFromImage
+        # C++ 里的等价流程：cv::imread -> cvtColor -> resize -> convertTo(1/255) -> (x-mean)/std -> blobFromImage
         t0 = time.perf_counter()
         raw_bgr = read_image(p, spec.in_channels)            # 步骤 1：原分辨率 BGR / 灰度
-        x = preprocess(raw_bgr, spec)                        # 步骤 1~5：1xCxHxW float32
+        # 显式调用统一预处理（步骤 1~5）：转色 -> 缩放 -> 像素范围检查并 /255 -> (x-mean)/std -> NCHW float32
+        x = preprocess(raw_bgr, spec)
         raw = to_model_color(raw_bgr, spec.in_channels)      # 供可视化（RGB / 灰度，仍是原分辨率）
         t_pre += time.perf_counter() - t0
 
@@ -386,8 +396,11 @@ def main():
         t_post += time.perf_counter() - t0
 
         if cfg["verbose"] and k == 1:      # 只打第一张，避免刷屏
-            print("[verbose] blob    shape=%s dtype=%s range=[%.3f, %.3f]" % (
-                x.shape, x.dtype, float(x.min()), float(x.max())))
+            # 预期范围：(0-mean)/std ~ (1-mean)/std（norm=01 时就是 [0,1]），范围明显偏离说明量纲/归一化不一致
+            lo = min((0.0 - m) / s for m, s in zip(spec.mean, spec.std))
+            hi = max((1.0 - m) / s for m, s in zip(spec.mean, spec.std))
+            print("[verbose] blob    shape=%s dtype=%s range=[%.3f, %.3f]（理论范围 [%.3f, %.3f]）" % (
+                x.shape, x.dtype, float(x.min()), float(x.max()), lo, hi))
             print("[verbose] logits  shape=%s dtype=%s range=[%.3f, %.3f]" % (
                 np.shape(logits), np.asarray(logits).dtype,
                 float(np.min(logits)), float(np.max(logits))))
@@ -430,6 +443,7 @@ def main():
                "model": model_file, "ckpt": str(ckpt) if ckpt is not None else None,
                "input_dir": str(src["images"]),
                "arch": meta["arch"], "encoder": meta["encoder"], "img_size": [hw[0], hw[1]],
+               "norm": spec.norm, "mean": list(spec.mean), "std": list(spec.std),   # 0~1 量纲，便于核对评估口径
                "num_classes": C, "class_names": class_names,
                "mdice": m["mdice"], "miou": m["miou"], "mprec": m["mprec"], "mrec": m["mrec"],
                "mf1": m["mf1"], "pacc": m["pacc"], "acc_fg": m["acc_fg"], "fg_ratio": m["fg_ratio"],

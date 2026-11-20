@@ -20,6 +20,12 @@
     （val_ratio / test_ratio 只影响生成，不影响已存在的 split.txt）
 没有 labels 目录时，自动回退为把图像目录里的 labelme .json 当标签用。
 图像与标签按文件名主干匹配（也接受 xxx_mask / xxx_label / xxx_gt 等后缀）。
+
+预处理（本版说明）：
+  SegDataset 不再接收 mean / std，而是接收 PreprocessSpec（inference/preprocess.py 定义，mean/std 为 0~1 量纲）。
+  归一化只走 inference.preprocess.normalize(img, spec)：像素范围检查 -> /255 -> (x-mean)/std，
+  与 predict / export_onnx / C++ 部署是同一个函数。train.py 会把 spec 放在 cfg["spec"] 里传进来；
+  单独调用 build_datasets 时没有 cfg["spec"]，则由 cfg 里的 norm / in_channels / img_size 自动构造。
 """
 import json
 import random
@@ -544,6 +550,7 @@ def mask_to_index(m, info):
 # --------------------------------------------------------------------------
 # 数据增强（只用 cv2/numpy；图像双线性、标签最近邻，保证二者几何变换一致）
 # 外观增强（对比度/亮度/gamma/噪声/模糊）主要用于缓解跨设备成像差异（域偏移）
+# 输出的图像是 float32、数值范围 0~255（与 normalize() 的 float 输入约定一致，由它统一 /255 并检查范围）
 # --------------------------------------------------------------------------
 def augment(img, mask, a):
     h, w = mask.shape[:2]
@@ -584,13 +591,13 @@ def augment(img, mask, a):
 # Dataset
 # --------------------------------------------------------------------------
 class SegDataset(Dataset):
-    def __init__(self, pairs, info, img_size, in_channels, mean, std, aug=None, cache=True):
+    def __init__(self, pairs, info, spec, aug=None, cache=True):
+        """spec: inference.preprocess.PreprocessSpec（in_channels / img_size / mean / std，mean/std 为 0~1 量纲）。
+        训练、验证、predict、ONNX、C++ 共用这一份契约，数据集里不再自己持有 mean/std。"""
         self.pairs, self.info = pairs, info
-        self.hw = to_hw(img_size)
-        self.in_channels, self.mean, self.std, self.aug = in_channels, mean, std, aug
-        # 预处理规格（in_channels / img_size / mean / std）统一由 inference.preprocess 定义，
-        # 训练、predict、ONNX、C++ 用的是同一份契约
-        self.spec = PreprocessSpec(in_channels, self.hw, mean, std)
+        self.spec, self.aug = spec, aug
+        self.hw = to_hw(spec.img_size)
+        self.in_channels = spec.in_channels
         self._cache = [None] * len(pairs)
         if cache:  # 先一次性解码+缩放到目标尺寸放内存，训练时不再反复解码大图
             for i in range(len(pairs)):
@@ -627,10 +634,11 @@ class SegDataset(Dataset):
         return len(self.pairs)
 
     def __getitem__(self, i):
-        img, mask = self.get_raw(i)                 # 步骤 1~3 的结果（模型色彩 + 模型输入尺寸）
-        if self.aug:                                # 数据增强插在 resize 与 normalize 之间
+        img, mask = self.get_raw(i)                 # 步骤 1~3 的结果（模型色彩 + 模型输入尺寸，uint8）
+        if self.aug:                                # 数据增强插在 resize 与 normalize 之间（输出 float32, 0~255）
             img, mask = augment(img, mask, self.aug)
-        x = to_blob(normalize(img, self.spec))[0]   # 步骤 4+5 -> CxHxW float32
+        # 步骤 4+5：统一归一化入口 —— 像素范围检查 -> /255 -> (x-mean)/std（0~1 量纲）-> CxHxW float32
+        x = to_blob(normalize(img, self.spec))[0]
         return torch.from_numpy(x), torch.from_numpy(np.ascontiguousarray(mask).astype(np.int64))
 
 
@@ -828,6 +836,21 @@ def split_indices(pairs, assign):
     return out["train"], out["val"], out["test"]
 
 
+def get_spec(cfg):
+    """取预处理规格：优先用 train.py 放进来的 cfg["spec"]；没有就由 cfg 的 norm / in_channels / img_size 构造
+    （方便脱离 train.py 单独调用 build_datasets）。并检查 spec 与 cfg 的通道数/尺寸一致，避免训练与规格各用各的。"""
+    spec = cfg.get("spec")
+    if spec is None:
+        spec = PreprocessSpec.from_config({**cfg, "img_size": list(to_hw(cfg["img_size"]))})
+    if int(spec.in_channels) != int(cfg["in_channels"]):
+        raise ValueError("cfg['spec'].in_channels=%d 与 cfg['in_channels']=%d 不一致" % (
+            spec.in_channels, int(cfg["in_channels"])))
+    if tuple(spec.img_size) != tuple(to_hw(cfg["img_size"])):
+        raise ValueError("cfg['spec'].img_size=%s 与 cfg['img_size']=%s 不一致" % (
+            tuple(spec.img_size), tuple(to_hw(cfg["img_size"]))))
+    return spec
+
+
 def build_datasets(cfg):
     """按 cfg 构建 (train_ds, val_ds, info)。划分是固定的（<dataset>/split.txt），
     同一数据集上不同模型完全一致；test 段不参与训练/验证，留给 predict.py 做最终评估。"""
@@ -851,9 +874,9 @@ def build_datasets(cfg):
     print("[data] 共 %d 对 -> 训练 %d / 验证 %d / 测试 %d（test 本次不参与训练与验证）" % (
         len(pairs), len(train_idx), len(val_idx), len(test_idx)))
 
+    spec = get_spec(cfg)        # 统一的预处理规格（mean/std 为 0~1 量纲）
     aug = {k[4:]: cfg[k] for k in cfg if k.startswith("aug_")}
-    common = dict(info=info, img_size=cfg["img_size"], in_channels=cfg["in_channels"],
-                  mean=cfg["mean"], std=cfg["std"], cache=cfg["cache"])
+    common = dict(info=info, spec=spec, cache=cfg["cache"])
     train_ds = SegDataset([pairs[i] for i in train_idx], aug=aug, **common)
     val_ds = SegDataset([pairs[i] for i in val_idx], aug=None, **common)
     info = dict(info, val_files=[pairs[i][0].name for i in val_idx],
