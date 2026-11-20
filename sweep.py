@@ -8,7 +8,7 @@ import csv
 import json
 import time
 import traceback
-
+import math
 import torch
 
 from models import RKNN_FRIENDLY_ARCHS, RKNN_FRIENDLY_ENCODERS, model_desc, run_name
@@ -34,20 +34,49 @@ DEFAULTS = {
 }
 # ===========================================================================
 
+def _valid_num(val):
+    return isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val)
 
 def pareto_flags(rows):
-    """精度(mdice)越高、GFLOPs 越低越好；返回每行是否不被其它行支配。"""
+    """多目标帕累托最优判定：
+      - mdice      : 越高越好
+      - params_m   : 越低越好（模型大小）
+      - gflops     : 越低越好（计算量）
+      - latency_ms : 越低越好（推理时间）
+
+    当另一行 o 在上述所有可用指标上均不差于 r，且至少有一项严格更优时，r 被支配（非帕累托最优）。
+    """
     flags = []
     for r in rows:
-        dom = False
+        if not _valid_num(r.get("mdice")):
+            flags.append(False)
+            continue
+
+        dominated = False
         for o in rows:
-            if o is r or r["gflops"] is None or o["gflops"] is None:
+            if o is r or not _valid_num(o.get("mdice")):
                 continue
-            if o["mdice"] >= r["mdice"] and o["gflops"] <= r["gflops"] and (
-                    o["mdice"] > r["mdice"] or o["gflops"] < r["gflops"]):
-                dom = True
+
+            # 收集双方都具备有效数值的开销维度（params_m / gflops / latency_ms）
+            cost_keys = [
+                k for k in ("params_m", "gflops", "latency_ms")
+                if _valid_num(r.get(k)) and _valid_num(o.get(k))
+            ]
+            # 若 r 缺少全部开销指标，则不让其他行仅凭 mdice 把它判掉，避免误杀
+            if not cost_keys:
+                continue
+
+            not_worse_acc = o["mdice"] >= r["mdice"]
+            strictly_better_acc = o["mdice"] > r["mdice"]
+
+            not_worse_cost = all(o[k] <= r[k] for k in cost_keys)
+            strictly_better_cost = any(o[k] < r[k] for k in cost_keys)
+
+            if not_worse_acc and not_worse_cost and (strictly_better_acc or strictly_better_cost):
+                dominated = True
                 break
-        flags.append(not dom)
+
+        flags.append(not dominated)
     return flags
 
 
@@ -113,7 +142,7 @@ def main():
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-    rows = [r for r in rows if r.get("mdice") is not None]
+    rows = [r for r in rows if _valid_num(r.get("mdice"))]
     rows.sort(key=lambda r: r["mdice"], reverse=True)
     flags = pareto_flags(rows)
 
@@ -135,7 +164,7 @@ def main():
     for a, e, msg in failed:
         print("[failed] %s + %s -> %s" % (a, e, msg))
     print("总耗时 %.1f 分钟，表格已保存: %s" % ((time.time() - t0) / 60, csv_path))
-    print("提示：带 * 的是 精度-计算量 帕累托最优；最终请再看 RKNN 量化后的精度与板上延迟。")
+    print("提示：带 * 的是 (mDice, 参数量, GFLOPs, 推理耗时) 帕累托最优；最终请再看 RKNN 量化后的精度与板上延迟。")
 
 
 if __name__ == "__main__":

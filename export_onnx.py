@@ -22,7 +22,7 @@ from utils import abspath, parse_args, resolve_path
 
 # ============================ 所有参数集中在这里 ============================
 DEFAULTS = {
-    "ckpt": "latest",       # latest = runs 下修改时间最新的 best.pth；也可写具体路径
+    "ckpt": r"E:\lfm\segzoo\runs\inner_circle_dataset\unet_resnet18_64x64\best.pth",       # latest = runs 下修改时间最新的 best.pth；也可写具体路径
     "runs_dir": "runs",
     "out": "",              # 空 = 与 ckpt 同目录的 model.onnx
     "opset": 12,            # RKNN-Toolkit2 对 opset 12 兼容最稳；失败时可试 13
