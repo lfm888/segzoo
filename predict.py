@@ -56,7 +56,7 @@ DEFAULTS = {
     "images_subdir": "",     # 指定 input_dir 下的图像子目录（空=自动找 train_dataset/images，否则用 input_dir 本身）
     "labels_subdir": "labels",   # 数据集目录里的标签子目录名
     "split": "test",         # test / val / train / all；该目录没有 split.txt 时自动按 all
-    "max_images": 20,         # 0 = 全部
+    "max_images": 0,         # 0 = 全部
     # ---- 输出 ----
     "out_dir": "",           # 空 = <ckpt 所在目录>/predict（指定了 input_dir 时是 predict_<目录名>）
     "device": "auto",        # auto / cuda / cpu（onnx / dnn 后端固定用 CPU）
